@@ -12,6 +12,7 @@
 #include <iomanip>
 #include "sensor_simulator.cuh"
 #include "maps.hpp"
+#include "simulator_config.hpp"
 
 using namespace raycast;
 namespace fs = std::filesystem;
@@ -80,9 +81,25 @@ void printProgressBar(int current, int total, int bar_width = 50)
     std::cout.flush();
 }
 
-int main(int argc, char **argv)
+int main(int argc, char **argv) try
 {
-    YAML::Node config = YAML::LoadFile(CONFIG_FILE_PATH);
+    std::string config_file = simulator_config::defaultConfig();
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument(argv[i]);
+        if (argument == "--help" || argument == "-h") {
+            std::cout << "Usage: dataset_generator [--config CONFIG_FILE]\n"
+                      << "WARNING: the configured save_path is deleted and recreated.\n";
+            return 0;
+        }
+        if (argument == "--config" && i + 1 < argc) {
+            config_file = argv[++i];
+        } else {
+            std::cerr << "Invalid argument: " << argument << std::endl;
+            return 1;
+        }
+    }
+    ensureCudaDevice();
+    YAML::Node config = simulator_config::load(config_file);
 
     // 1. 相机参数
     CameraParams camera;
@@ -111,7 +128,7 @@ int main(int argc, char **argv)
     sizeZ *= scale;
 
     // 3. 数据集参数
-    std::string save_path = config["save_path"].as<std::string>();
+    std::string save_path = simulator_config::datasetPath(config, config_file);
     int env_num = config["env_num"].as<int>();
     int image_num = config["image_num"].as<int>();
     float roll_range = config["roll_range"].as<float>();
@@ -232,4 +249,7 @@ int main(int argc, char **argv)
     std::cout << "\nDataset generation completed!" << std::endl;
 
     return 0;
+} catch (const std::exception& error) {
+    std::cerr << "Dataset generation failed: " << error.what() << std::endl;
+    return 1;
 }

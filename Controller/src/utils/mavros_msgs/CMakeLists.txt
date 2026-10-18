@@ -1,26 +1,14 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.16)
 project(mavros_msgs)
-
-find_package(catkin REQUIRED COMPONENTS geometry_msgs message_generation std_msgs)
-
-include_directories(include)
-
-add_message_files(
-  DIRECTORY msg
-  FILES
-  AttitudeTarget.msg
-  State.msg
-)
-
-add_service_files(
-  DIRECTORY srv
-  FILES
-  CommandBool.srv
-  SetMode.srv
-)
-
-generate_messages(DEPENDENCIES geometry_msgs std_msgs)
-
-catkin_package(
-  INCLUDE_DIRS include
-  CATKIN_DEPENDS geometry_msgs message_runtime std_msgs)
+find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/AttitudeTarget.msg"
+  "msg/State.msg"
+  "srv/CommandBool.srv"
+  "srv/SetMode.srv"
+  DEPENDENCIES geometry_msgs std_msgs)
+ament_export_dependencies(rosidl_default_runtime)
+ament_package()

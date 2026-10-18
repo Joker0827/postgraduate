@@ -1,73 +1,57 @@
-cmake_minimum_required(VERSION 3.0.2)
-project(sensor_simulator)
+cmake_minimum_required(VERSION 3.18)
+project(sensor_simulator LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-## Find catkin and any catkin packages
-find_package(catkin REQUIRED COMPONENTS
-        roscpp
-        nav_msgs
-        std_msgs
-        sensor_msgs
-        cv_bridge
-)
-find_package(Eigen3 REQUIRED)
-find_package(PCL REQUIRED)
-find_package(OpenCV REQUIRED)
-find_package(OpenMP)
-find_package(yaml-cpp REQUIRED)
-message(WARNING "OpenCV_VERSION: ${OpenCV_VERSION}")
-
-# CUDA
-find_package(CUDA REQUIRED)
-# Query the GPU architecture
-cuda_select_nvcc_arch_flags(ARCH_FLAGS)
-if("${ARCH_FLAGS}" STREQUAL "")
-  message(FATAL_ERROR
-    "Failed to automatically detect CUDA architecture. "
-    "Please manually set ARCH_FLAGS in CMakeList.txt (line 25) based on your device, for example:\n"
-    "  set(ARCH_FLAGS \"-gencode arch=compute_86,code=sm_86\")"
-  )
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
 endif()
-# If automatic detection fails, you can delete above (cuda_select_nvcc_arch_flags(ARCH_FLAGS) ... endif()) and manually set the architecture flags here
-# Examples (NVIDIA 5060 GPU):
-# set(ARCH_FLAGS "-gencode arch=compute_120,code=sm_120")
-message(WARNING "CUDA Architecture: ${ARCH_FLAGS}")
-set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} ${ARCH_FLAGS}")
 
-set(CMAKE_BUILD_TYPE Release)
-set(CMAKE_CXX_FLAGS "-O3")
-set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
+find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io octree kdtree filters)
+find_package(OpenCV REQUIRED)
+find_package(OpenMP REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
-## Declare a catkin package
-catkin_package(
-        INCLUDE_DIRS include
-        LIBRARIES sensor_simulator
-        CATKIN_DEPENDS roscpp
-        DEPENDS OpenCV)
+add_library(simulator_maps STATIC src/maps.cpp src/perlinnoise.cpp)
+target_include_directories(simulator_maps PUBLIC include ${PCL_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(simulator_maps PUBLIC Eigen3::Eigen ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} yaml-cpp)
+target_compile_definitions(simulator_maps PUBLIC SIMULATOR_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+ament_target_dependencies(simulator_maps PUBLIC ament_index_cpp)
 
-## Specify additional locations of header files
-include_directories(
-        include
-        ${catkin_INCLUDE_DIRS}
-        ${EIGEN3_INCLUDE_DIR}  # Eigen库路径
-        ${PCL_INCLUDE_DIRS}
-        ${OpenCV_INCLUDE_DIRS}
-)
+add_executable(sensor_simulator src/test_simulator.cpp src/sensor_simulator.cpp)
+target_link_libraries(sensor_simulator simulator_maps OpenMP::OpenMP_CXX)
+ament_target_dependencies(sensor_simulator rclcpp nav_msgs sensor_msgs cv_bridge pcl_conversions)
+install(TARGETS sensor_simulator DESTINATION lib/${PROJECT_NAME})
 
-add_executable(sensor_simulator src/test_simulator.cpp src/sensor_simulator.cpp src/maps.cpp src/perlinnoise.cpp)
-target_link_libraries(sensor_simulator ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} OpenMP::OpenMP_CXX yaml-cpp)
-target_compile_definitions(sensor_simulator PRIVATE CONFIG_FILE_PATH="${CMAKE_SOURCE_DIR}/config/config.yaml")
+option(ENABLE_CUDA "Build the GPU renderer and dataset generator" ON)
+if(ENABLE_CUDA)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures; RTX 4060: 89, Orin: 87")
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_library(raycast_cuda STATIC src/sensor_simulator.cu)
+  set_target_properties(raycast_cuda PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  target_include_directories(raycast_cuda PUBLIC include ${PCL_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(raycast_cuda PUBLIC CUDA::cudart Eigen3::Eigen ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
+  add_executable(sensor_simulator_cuda src/test_simulator_cuda.cpp)
+  target_link_libraries(sensor_simulator_cuda simulator_maps raycast_cuda)
+  ament_target_dependencies(sensor_simulator_cuda rclcpp nav_msgs sensor_msgs cv_bridge pcl_conversions)
 
-cuda_add_library(raycast_cuda src/sensor_simulator.cu)
-target_link_libraries(raycast_cuda ${CUDA_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+  add_executable(dataset_generator src/dataset_generator.cpp)
+  target_link_libraries(dataset_generator simulator_maps raycast_cuda)
+  install(TARGETS sensor_simulator_cuda dataset_generator DESTINATION lib/${PROJECT_NAME})
+endif()
 
-add_executable(sensor_simulator_cuda src/test_simulator_cuda.cpp src/maps.cpp src/perlinnoise.cpp)
-target_link_libraries(sensor_simulator_cuda ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} raycast_cuda yaml-cpp)
-target_compile_definitions(sensor_simulator_cuda PRIVATE CONFIG_FILE_PATH="${CMAKE_SOURCE_DIR}/config/config.yaml")
-
-add_executable(dataset_generator src/dataset_generator.cpp src/maps.cpp src/perlinnoise.cpp)
-target_link_libraries(dataset_generator ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} raycast_cuda yaml-cpp)
-target_compile_definitions(dataset_generator PRIVATE CONFIG_FILE_PATH="${CMAKE_SOURCE_DIR}/config/config.yaml")
+install(DIRECTORY config pointcloud DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS sim_odom.py DESTINATION lib/${PROJECT_NAME})
+ament_package()

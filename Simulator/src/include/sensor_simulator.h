@@ -9,10 +9,12 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <opencv2/opencv.hpp>
-#include <ros/ros.h>
-#include <nav_msgs/Odometry.h>
-#include <sensor_msgs/Image.h>
-#include <pcl_ros/point_cloud.h>
+#include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <pcl_conversions/pcl_conversions.h>
 #include <cv_bridge/cv_bridge.h>
 #include <iostream>
 #include <vector>
@@ -20,11 +22,13 @@
 #include <omp.h>
 #include <yaml-cpp/yaml.h>
 #include "maps.hpp"
+#include "simulator_config.hpp"
 
-class SensorSimulator {
+class SensorSimulator : public rclcpp::Node {
 public:
-    SensorSimulator(ros::NodeHandle &nh) : nh_(nh) {
-        YAML::Node config = YAML::LoadFile(CONFIG_FILE_PATH);
+    SensorSimulator() : Node("sensor_simulator") {
+        const auto config_file = declare_parameter<std::string>("config_file", simulator_config::defaultConfig());
+        YAML::Node config = simulator_config::load(config_file);
         // 读取camera参数
         fx = config["camera"]["fx"].as<float>();
         fy = config["camera"]["fy"].as<float>();
@@ -47,6 +51,9 @@ public:
         render_depth = config["render_depth"].as<bool>();
         float depth_fps = config["depth_fps"].as<float>();
         float lidar_fps = config["lidar_fps"].as<float>();
+        if (depth_fps <= 0 || lidar_fps <= 0) {
+            throw std::runtime_error("depth_fps and lidar_fps must be positive");
+        }
 
         std::string ply_file = config["ply_file"].as<std::string>();
         std::string odom_topic = config["odom_topic"].as<std::string>();
@@ -91,8 +98,7 @@ public:
             pcl::PointCloud<pcl::PointXYZ>::Ptr orig_cloud(new pcl::PointCloud<pcl::PointXYZ>());
             printf("1.Reading Point Cloud... \n");
             if (pcl::io::loadPLYFile(ply_file, *orig_cloud) == -1) {
-                PCL_ERROR("Couldn't read PLY file \n");
-                return;
+                throw std::runtime_error("Cannot read PLY file: " + ply_file);
             }
             
             printf("2.Processing... \n");
@@ -110,24 +116,33 @@ public:
         octree->setInputCloud(cloud);
         octree->addPointsFromInputCloud();
 
-        image_pub_ = nh_.advertise<sensor_msgs::Image>(depth_topic, 1);
-        point_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(lidar_topic, 1);
-        odom_sub_ = nh_.subscribe(odom_topic, 1, &SensorSimulator::odomCallback, this, ros::TransportHints().tcpNoDelay());
-        timer_depth_ = nh_.createTimer(ros::Duration(1 / depth_fps), &SensorSimulator::timerDepthCallback, this);
-        timer_lidar_ = nh_.createTimer(ros::Duration(1 / lidar_fps), &SensorSimulator::timerLidarCallback, this);
+        image_pub_ = create_publisher<sensor_msgs::msg::Image>(depth_topic, rclcpp::SensorDataQoS());
+        point_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(lidar_topic, rclcpp::SensorDataQoS());
+        map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/mock_map", rclcpp::QoS(1).transient_local().reliable());
+        sensor_msgs::msg::PointCloud2 map_message;
+        pcl::toROSMsg(*cloud, map_message);
+        map_message.header.frame_id = "world";
+        map_message.header.stamp = now();
+        map_pub_->publish(map_message);
+        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            odom_topic, rclcpp::SensorDataQoS(),
+            std::bind(&SensorSimulator::odomCallback, this, std::placeholders::_1));
+        timer_depth_ = create_wall_timer(std::chrono::duration<double>(1.0 / depth_fps),
+                                        std::bind(&SensorSimulator::timerDepthCallback, this));
+        timer_lidar_ = create_wall_timer(std::chrono::duration<double>(1.0 / lidar_fps),
+                                        std::bind(&SensorSimulator::timerLidarCallback, this));
         printf("3.Simulation Ready! \n");
-        ros::spin();
     }
 
-    void odomCallback(const nav_msgs::Odometry::ConstPtr &msg);
+    void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
 
     cv::Mat renderDepthImage();
 
     pcl::PointCloud<pcl::PointXYZ> renderLidarPointcloud();
 
-    void timerDepthCallback(const ros::TimerEvent &);
+    void timerDepthCallback();
 
-    void timerLidarCallback(const ros::TimerEvent &);
+    void timerLidarCallback();
 
     void expand_cloud(pcl::PointCloud<pcl::PointXYZ>::Ptr expanded_cloud, int direction = 0);
 
@@ -159,10 +174,12 @@ private:
     float max_lidar_dist{50};
 
 
-    ros::NodeHandle nh_;
-    ros::Publisher image_pub_, point_cloud_pub_;
-    ros::Subscriber odom_sub_;
-    ros::Timer timer_depth_, timer_lidar_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_pub_, map_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::TimerBase::SharedPtr timer_depth_, timer_lidar_;
+    builtin_interfaces::msg::Time odom_stamp_;
+    std::string body_frame_{"quadrotor"};
 };
 
 

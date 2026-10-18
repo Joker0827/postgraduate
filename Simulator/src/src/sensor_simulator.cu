@@ -1,4 +1,5 @@
 #include "sensor_simulator.cuh"
+#include <memory>
 
 namespace raycast
 {   
@@ -38,8 +39,11 @@ namespace raycast
                 h_map[idx]++;
             }
         }
-        cudaMalloc((void **)&map_cuda_, grid_total_size * sizeof(int));
-        cudaMemcpy(map_cuda_, h_map.data(), grid_total_size * sizeof(int), cudaMemcpyHostToDevice);
+        checkCuda(cudaMalloc((void **)&map_cuda_, grid_total_size * sizeof(int)), "Allocate CUDA map");
+        std::unique_ptr<int, decltype(&cudaFree)> allocation(map_cuda_, cudaFree);
+        checkCuda(cudaMemcpy(map_cuda_, h_map.data(), grid_total_size * sizeof(int), cudaMemcpyHostToDevice),
+                  "Copy map to CUDA device");
+        allocation.release();
     }
 
     __host__ __device__ Vector3i GridMap::Pos2Vox(const Vector3f &pos)
@@ -175,18 +179,19 @@ namespace raycast
     {   
         float* depth_values;
         size_t num_elements = camera_param->image_width * camera_param->image_height;
-        cudaMallocManaged(&depth_values, num_elements * sizeof(float));
+        checkCuda(cudaMallocManaged(&depth_values, num_elements * sizeof(float)), "Allocate CUDA depth buffer");
+        std::unique_ptr<float, decltype(&cudaFree)> allocation(depth_values, cudaFree);
 
         // 在GPU上启动核函数
         cameraRaycastKernel<<<camera_param->image_height, camera_param->image_width>>>(depth_values, *grid_map, *camera_param, T_wc);
+        checkCuda(cudaGetLastError(), "Launch depth raycast kernel");
         
-        cudaDeviceSynchronize();
+        checkCuda(cudaDeviceSynchronize(), "Synchronize depth raycast kernel");
 
         depth_image.create(camera_param->image_height, camera_param->image_width, CV_32FC1);
 
-        cudaMemcpy(depth_image.data, depth_values, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
-        
-        cudaFree(depth_values);
+        checkCuda(cudaMemcpy(depth_image.data, depth_values, num_elements * sizeof(float), cudaMemcpyDeviceToHost),
+                  "Copy CUDA depth image to host");
         return;
     }
 
@@ -255,15 +260,18 @@ namespace raycast
     void renderLidarPointcloud(GridMap *grid_map, LidarParams *lidar_param, cudaMat::SE3<float>& T_wc, pcl::PointCloud<pcl::PointXYZ>& lidar_points){
         Vector3f* point_values;
         size_t num_elements = lidar_param->vertical_lines * lidar_param->horizontal_num;
-        cudaMallocManaged(&point_values, num_elements * sizeof(Vector3f));
+        checkCuda(cudaMallocManaged(&point_values, num_elements * sizeof(Vector3f)), "Allocate CUDA lidar buffer");
+        std::unique_ptr<Vector3f, decltype(&cudaFree)> allocation(point_values, cudaFree);
 
         // 在GPU上启动核函数
         lidarRaycastKernel<<<lidar_param->vertical_lines, lidar_param->horizontal_num>>>(point_values, *grid_map, *lidar_param, T_wc);
+        checkCuda(cudaGetLastError(), "Launch lidar raycast kernel");
         
-        cudaDeviceSynchronize();
+        checkCuda(cudaDeviceSynchronize(), "Synchronize lidar raycast kernel");
 
         std::vector<Vector3f> cpu_points(num_elements);
-        cudaMemcpy(cpu_points.data(), point_values, num_elements * sizeof(Vector3f), cudaMemcpyDeviceToHost);
+        checkCuda(cudaMemcpy(cpu_points.data(), point_values, num_elements * sizeof(Vector3f), cudaMemcpyDeviceToHost),
+                  "Copy CUDA lidar points to host");
         
         lidar_points.points.clear();
         lidar_points.points.reserve(num_elements);
@@ -273,7 +281,6 @@ namespace raycast
                 lidar_points.points.emplace_back(point.x, point.y, point.z);
             }
         }
-        cudaFree(point_values);
         return;
     }
 

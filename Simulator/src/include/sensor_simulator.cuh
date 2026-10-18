@@ -11,9 +11,25 @@
 #include <pcl/point_cloud.h>   // For pcl::PointCloud
 #include <pcl/point_types.h>   // For pcl::PointXYZ
 #include <chrono>
+#include <stdexcept>
+#include <string>
 
 namespace raycast
 {
+    inline void checkCuda(cudaError_t status, const char* operation) {
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+        }
+    }
+
+    inline void ensureCudaDevice() {
+        int count = 0;
+        checkCuda(cudaGetDeviceCount(&count), "CUDA device detection");
+        if (count == 0) {
+            throw std::runtime_error("No CUDA device is available; use the CPU sensor_simulator instead");
+        }
+    }
+
     struct Vector3f
     {
         float x, y, z;
@@ -57,7 +73,7 @@ namespace raycast
         public:
             GridMap(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, float resolution, int occupy_threshold);
             ~GridMap() {};
-            void freeGridMap() {cudaFree(map_cuda_);}
+            void freeGridMap() { if (map_cuda_) { cudaFree(map_cuda_); map_cuda_ = nullptr; } }
             __host__ __device__ Vector3i Pos2Vox(const Vector3f &pos);
             __host__ __device__ Vector3f Vox2Pos(const Vector3i &vox);
             __host__ __device__ int Vox2Idx(const Vector3i &vox);
@@ -68,7 +84,7 @@ namespace raycast
             float raycast_step_; // raycast step
         private:
             // map param
-            int *map_cuda_;
+            int *map_cuda_{nullptr};
             float resolution_;                                           // grid resolution
             float origin_x_, origin_y_, origin_z_;                       // origin coordinates
             int grid_size_x_, grid_size_y_, grid_size_z_, grid_size_yz_; // grid sizes

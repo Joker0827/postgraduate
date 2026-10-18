@@ -6,10 +6,12 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <opencv2/opencv.hpp>
-#include <ros/ros.h>
-#include <nav_msgs/Odometry.h>
-#include <sensor_msgs/Image.h>
-#include <pcl_ros/point_cloud.h>
+#include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <pcl_conversions/pcl_conversions.h>
 #include <cv_bridge/cv_bridge.h>
 #include <iostream>
 #include <vector>
@@ -17,13 +19,16 @@
 #include "sensor_simulator.cuh"
 #include <chrono>
 #include "maps.hpp"
+#include "simulator_config.hpp"
 
 using namespace raycast;
 
-class SensorSimulator {
+class SensorSimulator : public rclcpp::Node {
 public:
-    SensorSimulator(ros::NodeHandle &nh) : nh_(nh) {
-        YAML::Node config = YAML::LoadFile(CONFIG_FILE_PATH);
+    SensorSimulator() : Node("sensor_simulator") {
+        const auto config_file = declare_parameter<std::string>("config_file", simulator_config::defaultConfig());
+        YAML::Node config = simulator_config::load(config_file);
+        ensureCudaDevice();
         // 读取camera参数
         camera = new CameraParams();
         camera->fx = config["camera"]["fx"].as<float>();
@@ -50,8 +55,11 @@ public:
         render_depth = config["render_depth"].as<bool>();
         float depth_fps = config["depth_fps"].as<float>();
         float lidar_fps = config["lidar_fps"].as<float>();
-        depth_pub_duration = ros::Duration(1 / depth_fps);
-        lidar_pub_duration = ros::Duration(1 / lidar_fps);
+        if (depth_fps <= 0 || lidar_fps <= 0) {
+            throw std::runtime_error("depth_fps and lidar_fps must be positive");
+        }
+        depth_pub_duration = rclcpp::Duration::from_seconds(1.0 / depth_fps);
+        lidar_pub_duration = rclcpp::Duration::from_seconds(1.0 / lidar_fps);
         
         std::string ply_file = config["ply_file"].as<std::string>();
         std::string odom_topic = config["odom_topic"].as<std::string>();
@@ -62,7 +70,7 @@ public:
         bool use_random_map = config["random_map"].as<bool>();
         float resolution = config["resolution"].as<float>();
         int occupy_threshold = config["occupy_threshold"].as<int>();
-        pcl_pub = nh.advertise<sensor_msgs::PointCloud2>("mock_map", 1);
+        pcl_pub = create_publisher<sensor_msgs::msg::PointCloud2>("/mock_map", rclcpp::QoS(1).transient_local().reliable());
         int seed = config["seed"].as<int>();
         int sizeX = config["x_length"].as<int>();
         int sizeY = config["y_length"].as<int>();
@@ -92,36 +100,45 @@ public:
         else {
             printf("1.Reading Point Cloud %s... \n", ply_file.c_str());
             if (pcl::io::loadPLYFile(ply_file, *cloud) == -1) {
-                PCL_ERROR("Couldn't read PLY file \n");
+                throw std::runtime_error("Cannot read PLY file: " + ply_file);
             }
         }
         pcl::toROSMsg(*cloud, output);
         output.header.frame_id = "world";
+        output.header.stamp = now();
+        pcl_pub->publish(output);
 
         std::cout<<"Pointloud size:"<<cloud->points.size()<<std::endl;
         printf("2.Mapping... \n");
         grid_map = new GridMap(cloud, resolution, occupy_threshold);
         
-        ros::Time next_depth_pub_time = ros::Time::now();
-        ros::Time next_lidar_pub_time = ros::Time::now();
+        next_depth_pub_time = now();
+        next_lidar_pub_time = now();
 
         // ROS
-        image_pub_ = nh_.advertise<sensor_msgs::Image>(depth_topic, 1);
-        point_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(lidar_topic, 1);
-        odom_sub_ = nh_.subscribe(odom_topic, 1, &SensorSimulator::odomCallback, this, ros::TransportHints().tcpNoDelay());
-        timer_map_   = nh_.createTimer(ros::Duration(1), &SensorSimulator::timerMapCallback, this);
+        image_pub_ = create_publisher<sensor_msgs::msg::Image>(depth_topic, rclcpp::SensorDataQoS());
+        point_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(lidar_topic, rclcpp::SensorDataQoS());
+        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            odom_topic, rclcpp::SensorDataQoS(),
+            std::bind(&SensorSimulator::odomCallback, this, std::placeholders::_1));
 
         printf("3.Simulation Ready! \n");
-        ros::spin();
     }
 
-    void odomCallback(const nav_msgs::Odometry::ConstPtr &msg);
+    ~SensorSimulator() override {
+        if (grid_map) {
+            grid_map->freeGridMap();
+            delete grid_map;
+        }
+        delete camera;
+        delete lidar;
+    }
 
-    void renderDepthCallback(const ros::Time stamp);
+    void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
 
-    void renderLidarCallback(const ros::Time stamp);
+    void renderDepthCallback(const builtin_interfaces::msg::Time& stamp);
 
-    void timerMapCallback(const ros::TimerEvent &);
+    void renderLidarCallback(const builtin_interfaces::msg::Time& stamp);
 
 private:
     bool render_depth{false};
@@ -132,17 +149,16 @@ private:
 
     CameraParams* camera;
     LidarParams* lidar;
-    GridMap* grid_map;
-    sensor_msgs::PointCloud2 output;
+    GridMap* grid_map{nullptr};
+    sensor_msgs::msg::PointCloud2 output;
     
-    ros::NodeHandle nh_;
-    ros::Publisher image_pub_, point_cloud_pub_;
-    ros::Publisher pcl_pub;
-    ros::Subscriber odom_sub_;
-    ros::Timer timer_depth_, timer_lidar_, timer_map_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_pub_, pcl_pub;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    std::string body_frame_{"quadrotor"};
 
-    ros::Time next_depth_pub_time, next_lidar_pub_time;
-    ros::Duration depth_pub_duration, lidar_pub_duration;
+    rclcpp::Time next_depth_pub_time{0, 0, RCL_ROS_TIME}, next_lidar_pub_time{0, 0, RCL_ROS_TIME};
+    rclcpp::Duration depth_pub_duration{0, 0}, lidar_pub_duration{0, 0};
     double depth_time{0.0}, lidar_time{0.0};
     int depth_count{0}, lidar_count{0};
     // mocka::Maps map;
@@ -150,7 +166,7 @@ private:
 
 
 
-void SensorSimulator::renderDepthCallback(const ros::Time stamp) {
+void SensorSimulator::renderDepthCallback(const builtin_interfaces::msg::Time& stamp) {
     if (!render_depth)
         return;
 
@@ -166,21 +182,17 @@ void SensorSimulator::renderDepthCallback(const ros::Time stamp) {
     depth_count++;
     // std::cout << "生成图像耗时: " << elapsed.count() << " 秒" << std::endl;
 
-    sensor_msgs::Image ros_image;
+    sensor_msgs::msg::Image ros_image;
     cv_bridge::CvImage cv_image;
     cv_image.header.stamp = stamp;
+    cv_image.header.frame_id = "camera_link";
     cv_image.encoding = sensor_msgs::image_encodings::TYPE_32FC1;
     cv_image.image = depth_image;
     cv_image.toImageMsg(ros_image);
-    image_pub_.publish(ros_image);
+    image_pub_->publish(ros_image);
 }
 
-void SensorSimulator::timerMapCallback(const ros::TimerEvent&) {
-    if (pcl_pub.getNumSubscribers() > 0)
-        pcl_pub.publish(output);    
-}
-
-void SensorSimulator::renderLidarCallback(const ros::Time stamp) {
+void SensorSimulator::renderLidarCallback(const builtin_interfaces::msg::Time& stamp) {
     if (!render_lidar)
         return;
 
@@ -196,14 +208,17 @@ void SensorSimulator::renderLidarCallback(const ros::Time stamp) {
     lidar_count++;
     // std::cout << "生成雷达耗时: " << elapsed.count() << " 秒" << std::endl;
 
-    sensor_msgs::PointCloud2 output;
+    sensor_msgs::msg::PointCloud2 output;
     pcl::toROSMsg(lidar_points, output);
     output.header.stamp = stamp;
-    output.header.frame_id = "odom";
-    point_cloud_pub_.publish(output);
+    output.header.frame_id = body_frame_;
+    point_cloud_pub_->publish(output);
 }
 
-void SensorSimulator::odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
+void SensorSimulator::odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+    if (!msg->child_frame_id.empty()) {
+        body_frame_ = msg->child_frame_id;
+    }
     quat.x() = msg->pose.pose.orientation.x;
     quat.y() = msg->pose.pose.orientation.y;
     quat.z() = msg->pose.pose.orientation.z;
@@ -214,12 +229,12 @@ void SensorSimulator::odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
     pos.y() = msg->pose.pose.position.y;
     pos.z() = msg->pose.pose.position.z;
 
-    ros::Time tnow = ros::Time::now();
+    const rclcpp::Time tnow = now();
 
     // 避免仿真odom消息中断，导致时间差太大
-    if (fabs((tnow - next_depth_pub_time).toSec()) > 10 * depth_pub_duration.toSec())
+    if (fabs((tnow - next_depth_pub_time).seconds()) > 10 * depth_pub_duration.seconds())
         next_depth_pub_time = tnow;
-    if (fabs((tnow - next_lidar_pub_time).toSec()) > 10 * lidar_pub_duration.toSec())
+    if (fabs((tnow - next_lidar_pub_time).seconds()) > 10 * lidar_pub_duration.seconds())
         next_lidar_pub_time = tnow;
 
     if (tnow >= next_depth_pub_time){
@@ -230,19 +245,24 @@ void SensorSimulator::odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
         next_lidar_pub_time += lidar_pub_duration;
         renderLidarCallback(msg->header.stamp);
     }
-    ros::Duration render_duration = ros::Time::now() - tnow;
+    const rclcpp::Duration render_duration = now() - tnow;
     if (render_duration > depth_pub_duration || render_duration > lidar_pub_duration){
         // Performance reference: should take < 1 ms on 3060 GPU & Ubuntu 20.04
-        ROS_WARN("Current Rendering time: %.2f ms, delay too much!", 1000 * render_duration.toSec());
+        RCLCPP_WARN(get_logger(), "Current Rendering time: %.2f ms, delay too much!", 1000 * render_duration.seconds());
         std::cout << "Average Depth Rendering time: " << (depth_time / (depth_count + 1e-8)) * 1000 << " ms" << std::endl;
         std::cout << "Average Lidar Rendering time: " << (lidar_time / (lidar_count + 1e-8)) * 1000 << " ms" << std::endl;
     }
 }
 
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "sensor_simulator_node");
-    ros::NodeHandle nh;
-
-    SensorSimulator sensor_simulator(nh);
+    rclcpp::init(argc, argv);
+    try {
+        rclcpp::spin(std::make_shared<SensorSimulator>());
+    } catch (const std::exception& error) {
+        RCLCPP_FATAL(rclcpp::get_logger("sensor_simulator"), "%s", error.what());
+        rclcpp::shutdown();
+        return 1;
+    }
+    rclcpp::shutdown();
     return 0;
 }

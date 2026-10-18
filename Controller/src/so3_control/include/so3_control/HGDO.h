@@ -1,7 +1,7 @@
 #ifndef HGDO_H_
 #define HGDO_H_
 
-#include "ros/ros.h"
+#include <cmath>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 

@@ -1,4 +1,9 @@
 .idea/
+build/
+install/
+log/
+__pycache__/
+*.py[cod]
 
 Controller/devel/
 Controller/build/

@@ -1,12 +1,12 @@
 #include <iostream>
 #include <so3_control/SO3Control.h>
 
-#include <ros/ros.h>
-
 SO3Control::SO3Control()
   : mass_(0.5)
   , g_(9.81)
 {
+  pos_.setZero();
+  vel_.setZero();
   acc_.setZero();
 }
 
@@ -42,9 +42,6 @@ SO3Control::calculateControl(const Eigen::Vector3d& des_pos,
                              const Eigen::Vector3d& kx,
                              const Eigen::Vector3d& kv)
 {
-  //  ROS_INFO("Error %lf %lf %lf", (des_pos - pos_).norm(),
-  //           (des_vel - vel_).norm(), (des_acc - acc_).norm());
-
   bool flag_use_pos = !(std::isnan(des_pos(0)) || std::isnan(des_pos(1)) || std::isnan(des_pos(2)));
   bool flag_use_vel = !(std::isnan(des_vel(0)) || std::isnan(des_vel(1)) || std::isnan(des_vel(2)));
   bool flag_use_acc = !(std::isnan(des_acc(0)) || std::isnan(des_acc(1)) || std::isnan(des_acc(2)));

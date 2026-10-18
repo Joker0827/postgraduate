@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
     将yopo模型转换为Tensorrt
     prepare:

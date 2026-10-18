@@ -2,6 +2,8 @@
 #define __GEOMETRY_UTILS_H
 
 #include <Eigen/Dense>
+#include <cassert>
+#include <cmath>
 
 /* clang-format off */
 namespace uav_utils {

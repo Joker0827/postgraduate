@@ -987,7 +987,7 @@ void Maps::forest()
   pcl::PointCloud<pcl::PointXYZ>::Ptr tree_cloud(new pcl::PointCloud<pcl::PointXYZ>());
   if (pcl::io::loadPLYFile(tree_file, *tree_cloud) == -1)
   {
-    ROS_ERROR("Error: Cannot read the tree PLY file. Please check the config.yaml.");
+    PCL_ERROR("Error: Cannot read the tree PLY file. Please check the config.yaml.\n");
     return;
   }
 

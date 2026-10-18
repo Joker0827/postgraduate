@@ -1,9 +1,15 @@
-import rospy
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.utilities import remove_ros_args
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
-from threading import Lock
+from threading import RLock
 from sensor_msgs.msg import Image
 
 import cv2
@@ -15,7 +21,8 @@ import argparse
 from scipy.spatial.transform import Rotation as R
 
 from config.config import cfg
-from control_msg import PositionCommand
+from quadrotor_msgs.msg import PositionCommand
+from ros_utils import decode_depth_image
 from policy.yopo_network import YopoNetwork
 from policy.poly_solver import *
 from policy.state_transform import *
@@ -26,10 +33,19 @@ except ImportError:
     print("tensorrt not found.")
 
 
-class YopoNet:
+class YopoNet(Node):
     def __init__(self, config, weight):
-        self.config = config
-        rospy.init_node('yopo_net', anonymous=False)
+        super().__init__('yopo_net')
+        self.config = {name: self.declare_parameter(name, value).value
+                       for name, value in config.items()}
+        weight = self.declare_parameter('weight', weight).value
+        velocity = self.declare_parameter('velocity', float(cfg['velocity'])).value
+        if velocity <= 0:
+            raise ValueError('velocity must be positive')
+        cfg['velocity'] = velocity
+        self.arrival_distance = self.declare_parameter('arrival_distance', 5.0).value
+        self.goal_altitude = self.declare_parameter('goal_altitude', 2.0).value
+        self.world_frame = self.declare_parameter('world_frame', 'world').value
         # load params
         cfg["train"] = False
         self.height = cfg['image_height']
@@ -57,7 +73,7 @@ class YopoNet:
         self.optimal_poly_x = None
         self.optimal_poly_y = None
         self.optimal_poly_z = None
-        self.lock = Lock()
+        self.lock = RLock()
         self.last_control_msg = None
         self.state_transform = StateTransform()
         self.lattice_primitive = LatticePrimitive.get_instance()
@@ -74,38 +90,50 @@ class YopoNet:
 
         # Load Network
         if self.use_trt:
+            if 'TRTModule' not in globals():
+                raise RuntimeError('TensorRT requested, but torch2trt is not installed')
             self.policy = TRTModule()
-            self.policy.load_state_dict(torch.load(weight))
+            self.policy.load_state_dict(torch.load(weight, map_location=self.device))
         else:
-            state_dict = torch.load(weight, weights_only=True)
+            state_dict = torch.load(weight, map_location=self.device, weights_only=True)
             self.policy = YopoNetwork()
             self.policy.load_state_dict(state_dict)
             self.policy = self.policy.to(self.device)
             self.policy.eval()
         self.warm_up()
 
-        # ros publisher
-        self.lattice_traj_pub = rospy.Publisher("/yopo_net/lattice_trajs_visual", MarkerArray, queue_size=1)
-        self.best_traj_pub = rospy.Publisher("/yopo_net/best_traj_visual", Path, queue_size=1)
-        self.all_trajs_pub = rospy.Publisher("/yopo_net/trajs_visual", MarkerArray, queue_size=1)
-        self.ctrl_pub = rospy.Publisher(self.config["ctrl_topic"], PositionCommand, queue_size=1)
-        # ros subscriber
-        self.odom_sub = rospy.Subscriber(self.config['odom_topic'], Odometry, self.callback_odometry, queue_size=1, tcp_nodelay=True)
-        self.depth_sub = rospy.Subscriber(self.config['depth_topic'], Image, self.callback_depth, queue_size=1, tcp_nodelay=True)
-        self.goal_sub = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.callback_set_goal, queue_size=1)
-        # ros timer
-        rospy.sleep(1.0)  # wait connection...
-        self.timer_ctrl = rospy.Timer(rospy.Duration(self.ctrl_dt), self.control_pub)
-        print("YOPO Net Node Ready!")
-        rospy.spin()
+        sensor_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                                reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.state_group = MutuallyExclusiveCallbackGroup()
+        self.depth_group = MutuallyExclusiveCallbackGroup()
+        self.lattice_traj_pub = self.create_publisher(MarkerArray, '/yopo_net/lattice_trajs_visual', 1)
+        self.best_traj_pub = self.create_publisher(Path, '/yopo_net/best_traj_visual', 1)
+        self.all_trajs_pub = self.create_publisher(MarkerArray, '/yopo_net/trajs_visual', 1)
+        self.ctrl_pub = self.create_publisher(PositionCommand, self.config['ctrl_topic'], 1)
+        self.odom_sub = self.create_subscription(Odometry, self.config['odom_topic'], self.callback_odometry,
+                                                 sensor_qos, callback_group=self.state_group)
+        self.depth_sub = self.create_subscription(Image, self.config['depth_topic'], self.callback_depth,
+                                                  sensor_qos, callback_group=self.depth_group)
+        self.goal_sub = self.create_subscription(PoseStamped, self.config['goal_topic'], self.callback_set_goal,
+                                                 1, callback_group=self.state_group)
+        self.timer_ctrl = self.create_timer(self.ctrl_dt, self.control_pub, callback_group=self.state_group)
+        self.get_logger().info(f'YOPO ready: device={self.device}, weight={weight}')
 
     def callback_set_goal(self, data):
-        self.goal = np.asarray([data.pose.position.x, data.pose.position.y, 2])
-        self.arrive = False
+        if data.header.frame_id and data.header.frame_id != self.world_frame:
+            self.get_logger().warning(f'Goal frame must be {self.world_frame}; received {data.header.frame_id}')
+            return
+        with self.lock:
+            self.goal = np.asarray([data.pose.position.x, data.pose.position.y, self.goal_altitude])
+            self.arrive = False
         print(f"New Goal: ({data.pose.position.x:.1f}, {data.pose.position.y:.1f})")
 
     # the first frame
     def callback_odometry(self, data):
+        with self.lock:
+            self._update_odometry(data)
+
+    def _update_odometry(self, data):
         self.odom = data
         if not self.desire_init:
             self.desire_pos = np.array((self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z))
@@ -117,7 +145,7 @@ class YopoNet:
         self.odom_init = True
 
         pos = np.array((self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z))
-        if np.linalg.norm(pos - self.goal) < 5 and not self.arrive:
+        if np.linalg.norm(pos - self.goal) < self.arrival_distance and not self.arrive:
             print("Arrive!")
             self.arrive = True
 
@@ -143,16 +171,17 @@ class YopoNet:
 
     @torch.inference_mode()
     def callback_depth(self, data):
-        if not self.odom_init: return
+        with self.lock:
+            if not self.odom_init:
+                return
 
         # 1. Depth Image Process (Be careful with the depth units in your application)
         time0 = time.time()
-        if data.encoding == "32FC1":    # Simulator, meter
-            depth = np.frombuffer(data.data, dtype=np.float32).reshape(data.height, data.width)
-        elif data.encoding == "16UC1":  # RealSense, millimeter
-            depth = np.frombuffer(data.data, dtype=np.uint16).reshape(data.height, data.width).astype(np.float32) / 1000.0
-        else:
-            raise ValueError(f"Unsupported depth encoding: {data.encoding}. Expected '32FC1' or '16UC1'.")
+        try:
+            depth = decode_depth_image(data)
+        except ValueError as error:
+            self.get_logger().error(str(error))
+            return
 
         if depth.shape[0] != self.height or depth.shape[1] != self.width:
             depth = cv2.resize(depth, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
@@ -170,7 +199,9 @@ class YopoNet:
         # input prepare
         time1 = time.time()
         depth_input = torch.from_numpy(depth).to(self.device, non_blocking=True)  # (non_blocking: copying speed 3x)
-        obs_norm = self.process_odom()
+        with self.lock:
+            obs_norm = self.process_odom()
+            rotation_wc = self.Rotation_wc.copy()
         obs_input = self.state_transform.prepare_input_cpu(obs_norm)
         obs_input = torch.from_numpy(obs_input).to(self.device, non_blocking=True)
         # torch.cuda.synchronize()
@@ -186,7 +217,7 @@ class YopoNet:
         endstate, score = self.process_output(endstate_pred, score_pred, return_all_preds=self.visualize)
         # Vectorization: transform the prediction(P V A in body frame) to the world frame with the attitude (without the position)
         endstate_c = endstate.reshape(-1, 3, 3).transpose(0, 2, 1)  # [N, 9] -> [N, 3, 3] -> [px vx ax, py vy ay, pz vz az]
-        endstate_w = np.matmul(self.Rotation_wc, endstate_c)
+        endstate_w = np.matmul(rotation_wc, endstate_c)
 
         action_id = np.argmin(score) if self.visualize else 0
         with self.lock:  # Python3.8: threads are scheduled using time slices, add the lock to ensure safety
@@ -205,7 +236,11 @@ class YopoNet:
 
         self.print_time(time0, time1, time2, time3, time4, time5)
 
-    def control_pub(self, _timer):
+    def control_pub(self):
+        with self.lock:
+            self._publish_control()
+
+    def _publish_control(self):
         if self.ctrl_time is None or self.ctrl_time > self.traj_time:
             return
         if self.arrive and self.last_control_msg is not None:
@@ -217,7 +252,8 @@ class YopoNet:
         with self.lock:  # Python3.8: threads are scheduled using time slices, add the lock to ensure safety and publish frequency
             self.ctrl_time += self.ctrl_dt
             control_msg = PositionCommand()
-            control_msg.header.stamp = rospy.Time.now()
+            control_msg.header.stamp = self.get_clock().now().to_msg()
+            control_msg.header.frame_id = self.world_frame
             control_msg.trajectory_flag = control_msg.TRAJECTORY_STATUS_READY
             control_msg.position.x = self.optimal_poly_x.get_position(self.ctrl_time)
             control_msg.position.y = self.optimal_poly_y.get_position(self.ctrl_time)
@@ -260,7 +296,7 @@ class YopoNet:
         start_pos = self.desire_pos if self.plan_from_reference else np.array((self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z))
         start_vel = self.desire_vel if self.plan_from_reference else np.array((self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z))
         # best predicted trajectory
-        if self.best_traj_pub.get_num_connections() > 0:
+        if self.best_traj_pub.get_subscription_count() > 0:
             t_values = np.arange(0, self.traj_time, dt)
             points_array = np.stack((
                 self.optimal_poly_x.get_position(t_values),
@@ -268,8 +304,8 @@ class YopoNet:
                 self.optimal_poly_z.get_position(t_values)
             ), axis=-1)
             path = Path()
-            path.header.stamp = rospy.Time.now()
-            path.header.frame_id = 'world'
+            path.header.stamp = self.get_clock().now().to_msg()
+            path.header.frame_id = self.world_frame
             for p in points_array:
                 ps = PoseStamped()
                 ps.header = path.header
@@ -278,7 +314,7 @@ class YopoNet:
                 path.poses.append(ps)
             self.best_traj_pub.publish(path)
         # lattice primitive
-        if self.visualize and self.lattice_traj_pub.get_num_connections() > 0:
+        if self.visualize and self.lattice_traj_pub.get_subscription_count() > 0:
             lattice_endstate = self.state_transform.lattice_pos_np
             lattice_endstate = np.dot(lattice_endstate, self.Rotation_wc.T)
             zero_state = np.zeros_like(lattice_endstate)
@@ -294,10 +330,10 @@ class YopoNet:
                 lattice_poly_y.get_position(t_values),
                 lattice_poly_z.get_position(t_values)
             ), axis=-1).reshape(-1, t_values.size, 3)
-            colors = [ColorRGBA(0.4, 0.4, 0.4, 0.5)] * pts.shape[0]
+            colors = [ColorRGBA(r=0.4, g=0.4, b=0.4, a=0.5)] * pts.shape[0]
             self.lattice_traj_pub.publish(self._line_markers(pts, 'lattice', colors, 0.1))
         # all predicted trajectories
-        if self.visualize and self.all_trajs_pub.get_num_connections() > 0:
+        if self.visualize and self.all_trajs_pub.get_subscription_count() > 0:
             all_poly_x = Polys5Solver(start_pos[0], start_vel[0], self.desire_acc[0],
                                       pred_endstate[:, 0, 0] + start_pos[0], pred_endstate[:, 0, 1], pred_endstate[:, 0, 2], self.traj_time)
             all_poly_y = Polys5Solver(start_pos[1], start_vel[1], self.desire_acc[1],
@@ -312,15 +348,15 @@ class YopoNet:
             ), axis=-1).reshape(-1, t_values.size, 3)
             s = np.asarray(pred_score, dtype=float).reshape(-1)
             sn = (s - s.min()) / (s.max() - s.min()) if s.max() - s.min() > 1e-6 else np.full_like(s, 0.5)
-            colors = [ColorRGBA(float(x), 1.0 - float(x), 0.0, 0.5) for x in sn]  # low score (best) → green
+            colors = [ColorRGBA(r=float(x), g=float(1.0 - x), b=0.0, a=0.5) for x in sn]
             self.all_trajs_pub.publish(self._line_markers(pts, 'trajs', colors, 0.1))
 
     def _line_markers(self, pts, ns, colors, width):
-        now = rospy.Time.now()
+        now = self.get_clock().now().to_msg()
         msgs = MarkerArray()
         for i, line_pts in enumerate(pts):
             m = Marker()
-            m.header.frame_id = 'world'
+            m.header.frame_id = self.world_frame
             m.header.stamp = now
             m.ns = ns
             m.id = i
@@ -329,7 +365,7 @@ class YopoNet:
             m.pose.orientation.w = 1.0
             m.scale.x = width
             m.color = colors[i]
-            m.points = [Point(float(p[0]), float(p[1]), float(p[2])) for p in line_pts]
+            m.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in line_pts]
             msgs.markers.append(m)
         return msgs
 
@@ -351,7 +387,7 @@ class YopoNet:
         total_time = (time5 - time0) * 1000
         tolerance = 1000.0 / self.depth_fps
         if total_time > tolerance:
-            rospy.logwarn(f"Warn: Processing time {(time5 - time0) * 1000:.2f} ms exceeds {tolerance:.2f} ms, may cause message lag!")
+            self.get_logger().warning(f"Processing time {(time5 - time0) * 1000:.2f} ms exceeds {tolerance:.2f} ms")
             print(f"\033[34mCurrent Time Consuming:\033[0m "
                   f"depth-interpolation: \033[32m{1000 * (time1 - time0):.2f} ms\033[0m; "
                   f"data-prepare: \033[32m{1000 * (time2 - time1):.2f} ms\033[0m; "
@@ -382,20 +418,51 @@ def parser():
     return parser
 
 
-if __name__ == "__main__":
-    args = parser().parse_args()
+def main():
+    args = parser().parse_args(remove_ros_args()[1:])
     base_dir = os.path.dirname(os.path.abspath(__file__))
     weight = "yopo_trt.pth" if args.use_tensorrt else base_dir + "/saved/YOPO_{}/epoch{}.pth".format(args.trial, args.epoch)
     print("load weight from:", weight)
 
-    settings = {'use_tensorrt': args.use_tensorrt,
-                'goal': [50, 0, 2],      # 目标点位置
-                'pitch_angle_deg': -0,   # 相机俯仰角(仰为负)
+    settings = {'use_tensorrt': bool(args.use_tensorrt),
+                'goal': [50.0, 0.0, 2.0],      # 目标点位置
+                'pitch_angle_deg': 0.0,   # 相机俯仰角(仰为负)
                 'odom_topic': '/sim/odom',                   # 里程计话题
                 'depth_topic': '/depth_image',               # 深度图话题
                 'ctrl_topic': '/so3_control/pos_cmd',        # 控制器话题
+                'goal_topic': '/move_base_simple/goal',
                 'plan_from_reference': False,   # 从参考状态规划？位置控制器: True, 神经网络直接控制: False
                 'verbose': False,               # 打印耗时？
                 'visualize': True               # 可视化所有轨迹？(实飞改为False节省计算)
                 }
-    YopoNet(settings, weight)
+    rclpy.init()
+    node = None
+    executor = MultiThreadedExecutor(num_threads=3)
+    try:
+        node = YopoNet(settings, weight)
+        executor.add_node(node)
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # A depth callback can be inside a CUDA synchronization when launch sends
+        # SIGINT. Stop scheduling new callbacks, then bound executor teardown so
+        # the node does not turn a normal shutdown into exit code -2.
+        try:
+            executor.shutdown(timeout_sec=0.5)
+        except KeyboardInterrupt:
+            pass
+        if node is not None:
+            try:
+                node.destroy_node()
+            except KeyboardInterrupt:
+                pass
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
+
+
+if __name__ == '__main__':
+    main()

@@ -1,194 +1,176 @@
 #ifndef MAVROS_INTERFACE_H_
 #define MAVROS_INTERFACE_H_
 
-#include "ros/ros.h"
-#include <stdio.h>
-#include <stdlib.h>
+#include <chrono>
+#include <memory>
 #include <string>
-#include <iostream>
-
-#include <mavros_msgs/AttitudeTarget.h>
-#include <mavros_msgs/State.h>
-#include <mavros_msgs/SetMode.h>
-#include <mavros_msgs/CommandBool.h>
-
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <rclcpp/rclcpp.hpp>
+#include <mavros_msgs/msg/attitude_target.hpp>
+#include <mavros_msgs/msg/state.hpp>
+#include <mavros_msgs/srv/command_bool.hpp>
+#include <mavros_msgs/srv/set_mode.hpp>
 
 class Mavros_Interface
 {
 public:
-    Mavros_Interface() : _nh("~cmd")
+    explicit Mavros_Interface(rclcpp::Node &node, bool simulation)
+        : node_(node), simulation_(simulation)
     {
-        _state.reset();
-        std::string base_name = "/mavros";
-        // char id_str[10];
-        // sprintf(id_str, "%d", id);
-        // base_name += id_str;
-
-        std::string att_target_pub_name;
-        att_target_pub_name = base_name + "/setpoint_raw/attitude";
-        att_target_pub = _nh.advertise<mavros_msgs::AttitudeTarget>(att_target_pub_name.c_str(), 10);
-
-        std::string state_sub_name;
-        state_sub_name = base_name + "/state";
-        state_sub = _nh.subscribe(state_sub_name.c_str(), 10, &Mavros_Interface::state_cb, this);
-
-        std::string set_mode_s_name;
-        set_mode_s_name = base_name + "/set_mode";
-        set_mode_client = _nh.serviceClient<mavros_msgs::SetMode>(set_mode_s_name.c_str());
-
-        std::string arm_disarm_s_name;
-        arm_disarm_s_name = base_name + "/cmd/arming";
-        arm_disarm_client = _nh.serviceClient<mavros_msgs::CommandBool>(arm_disarm_s_name.c_str());
+        const auto base = node_.declare_parameter<std::string>("mavros_namespace", "/mavros");
+        att_target_pub_ = node_.create_publisher<mavros_msgs::msg::AttitudeTarget>(
+            base + "/setpoint_raw/attitude", 10);
+        if (!simulation_) {
+            state_sub_ = node_.create_subscription<mavros_msgs::msg::State>(
+                base + "/state", rclcpp::SensorDataQoS(),
+                [this](mavros_msgs::msg::State::ConstSharedPtr state) {
+                    has_armed_ = state->armed;
+                    offboard_enabled_ = state->mode == "OFFBOARD";
+                });
+        }
+        set_mode_client_ = node_.create_client<mavros_msgs::srv::SetMode>(base + "/set_mode");
+        arm_disarm_client_ = node_.create_client<mavros_msgs::srv::CommandBool>(base + "/cmd/arming");
     }
 
-    ~Mavros_Interface() {}
-
-    typedef struct mavros_state_t
+    void get_status(bool &armed, bool &offboard) const
     {
-        ros::Time header;
-        bool has_armed;
-        bool offboard_enabled;
-        void reset()
-        {
-            has_armed = false;
-            offboard_enabled = false;
-        }
-        mavros_state_t()
-        {
-            reset();
-        }
-    };
-
-    void state_cb(const mavros_msgs::State &state_data)
-    {
-        mavros_msgs::State temp_data = state_data;
-        _state.header = state_data.header.stamp;
-        _state.has_armed = state_data.armed;
-        if (state_data.mode == "OFFBOARD")
-        {
-            _state.offboard_enabled = true;
-        }
-        else
-        {
-            _state.offboard_enabled = false;
-        }
+        armed = has_armed_;
+        offboard = offboard_enabled_;
     }
 
-    void get_status(bool &arm_state, bool &offboard_enabled)
-    {
-        arm_state = _state.has_armed;
-        offboard_enabled = _state.offboard_enabled;
-    }
+    void request_arm_and_offboard() { begin_operation(true); }
+    void request_disarm() { begin_operation(false); }
+    bool operation_failed() const { return failed_; }
+    bool operation_pending() const { return active_; }
 
-    bool set_arm_and_offboard()
+    // All callbacks and poll execute in the node's default callback group.
+    void poll()
     {
-        ros::Rate _ofb_check_rate(1);
-        int try_arm_ofb_times = 0;
-        while (!_state.offboard_enabled || !_state.has_armed)
-        {
-            if (_state.offboard_enabled)
-            {
-                ros::Rate _arm_check_rate(1);
-                while (!_state.has_armed)
-                {
-                    mavros_msgs::CommandBool arm_srv;
-                    arm_srv.request.value = true;
-                    if (arm_disarm_client.call(arm_srv))
-                    {
-                        ROS_INFO("vehicle ARMED");
-                    }
-                    try_arm_ofb_times = try_arm_ofb_times + 1;
-                    if (try_arm_ofb_times >= 3)
-                    {
-                        ROS_ERROR("try 3 times, cannot armed uav, give up!");
-                        return false;
-                    }
-                    _arm_check_rate.sleep();
-                }
+        if (!active_)
+            return;
+        if ((arming_ && has_armed_ && offboard_enabled_) || (!arming_ && !has_armed_)) {
+            cancel_pending_request();
+            active_ = false;
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - started_ > std::chrono::seconds(15)) {
+            fail("Timed out waiting for MAVROS state confirmation");
+            return;
+        }
+        if (pending_) {
+            if (now - last_request_ > std::chrono::seconds(3)) {
+                cancel_pending_request();
             }
-            else
-            {
-                ROS_INFO("not in OFFBOARD mode");
-                mavros_msgs::SetMode set_mode_srv;
-                set_mode_srv.request.base_mode = 0;
-                set_mode_srv.request.custom_mode = "OFFBOARD";
-                if (!set_mode_client.call(set_mode_srv))
-                {
-                    return false;
-                }
-                ROS_INFO("switch to OFFBOARD mode");
-                _ofb_check_rate.sleep();
-            }
+            return;
         }
-        return true;
-    }
-
-    /* void set_arm(const ros::TimerEvent& event) {
-        if(_state.offboard_enabled) {
-            mavros_msgs::CommandBool arm_srv;
-            arm_srv.request.value = true;
-            if (arm_disarm_client.call(arm_srv)) {
-                ROS_INFO("vehicle ARMED");
-            }
+        if (now - last_request_ < std::chrono::seconds(1))
+            return;
+        const bool set_mode = arming_ && !offboard_enabled_;
+        if (set_mode != request_is_mode_) {
+            request_is_mode_ = set_mode;
+            attempts_ = 0;
+        }
+        if (attempts_ >= 3) {
+            fail("MAVROS operation failed after 3 attempts");
+            return;
+        }
+        if (set_mode) {
+            if (!set_mode_client_->service_is_ready())
+                return;
+            auto request = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+            request->base_mode = 0;
+            request->custom_mode = "OFFBOARD";
+            auto future = set_mode_client_->async_send_request(request,
+                [this](rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture result) {
+                    pending_ = false;
+                    if (!result.get()->mode_sent)
+                        RCLCPP_WARN(node_.get_logger(), "MAVROS rejected OFFBOARD mode request");
+                });
+            request_id_ = future.request_id;
         } else {
-            ROS_INFO("not in OFFBOARD mode");
+            if (!arm_disarm_client_->service_is_ready())
+                return;
+            auto request = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
+            request->value = arming_;
+            auto future = arm_disarm_client_->async_send_request(request,
+                [this](rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture result) {
+                    pending_ = false;
+                    if (!result.get()->success)
+                        RCLCPP_WARN(node_.get_logger(), "MAVROS rejected arm/disarm request");
+                });
+            request_id_ = future.request_id;
         }
-    } */
-
-    bool set_disarm()
-    {
-        ros::Rate _arm_check_rate(1);
-        while (_state.has_armed)
-        {
-            mavros_msgs::CommandBool arm_srv;
-            arm_srv.request.value = false;
-            if (!arm_disarm_client.call(arm_srv))
-            {
-                return false;
-            }
-            ROS_INFO("vehicle DISARMED");
-            _arm_check_rate.sleep();
-        }
-        return true;
+        pending_ = true;
+        ++attempts_;
+        last_request_ = now;
     }
 
-    void pub_att_thrust_cmd(const Eigen::Quaterniond &q_d, const double &thrust_d)
+    void pub_att_thrust_cmd(const Eigen::Quaterniond &q, double thrust)
     {
-        /*
-            目前mavros用的是北东地的坐标系，为了和pid通用所以没有改mavros而是在这里改为北东地
-        */
-        mavros_msgs::AttitudeTarget at_cmd;
-        at_cmd.header.stamp = ros::Time::now();
-        at_cmd.type_mask = at_cmd.IGNORE_ROLL_RATE | at_cmd.IGNORE_PITCH_RATE | at_cmd.IGNORE_YAW_RATE;
-        at_cmd.thrust = (float)thrust_d;
-        at_cmd.orientation.w = q_d.w();
-        at_cmd.orientation.x = q_d.x();
-        at_cmd.orientation.y = -q_d.y();
-        at_cmd.orientation.z = -q_d.z();
-        att_target_pub.publish(at_cmd);
-    }
-
-    // for simulation
-    void set_arm_and_offboard_manually()
-    {
-        _state.has_armed = true;
-        _state.offboard_enabled = true;
-    }
-
-    void set_disarm_manually()
-    {
-        _state.has_armed = false;
+        mavros_msgs::msg::AttitudeTarget command;
+        command.header.stamp = node_.now();
+        command.type_mask = command.IGNORE_ROLL_RATE | command.IGNORE_PITCH_RATE |
+                            command.IGNORE_YAW_RATE;
+        command.thrust = static_cast<float>(thrust);
+        command.orientation.w = q.w();
+        command.orientation.x = q.x();
+        command.orientation.y = -q.y();
+        command.orientation.z = -q.z();
+        att_target_pub_->publish(command);
     }
 
 private:
-    ros::NodeHandle _nh;
-    ros::Publisher att_target_pub;
-    ros::Subscriber state_sub;
-    ros::ServiceClient set_mode_client;
-    ros::ServiceClient arm_disarm_client;
-    mavros_state_t _state;
+    void begin_operation(bool arming)
+    {
+        cancel_pending_request();
+        arming_ = arming;
+        failed_ = false;
+        attempts_ = 0;
+        request_is_mode_ = arming;
+        started_ = std::chrono::steady_clock::now();
+        last_request_ = started_ - std::chrono::seconds(1);
+        if (simulation_) {
+            has_armed_ = arming;
+            offboard_enabled_ = arming;
+            active_ = false;
+        } else {
+            active_ = true;
+        }
+    }
+
+    void fail(const char *message)
+    {
+        active_ = false;
+        failed_ = true;
+        cancel_pending_request();
+        RCLCPP_ERROR(node_.get_logger(), "%s", message);
+    }
+
+    void cancel_pending_request()
+    {
+        if (!pending_)
+            return;
+        if (request_is_mode_)
+            set_mode_client_->remove_pending_request(request_id_);
+        else
+            arm_disarm_client_->remove_pending_request(request_id_);
+        pending_ = false;
+    }
+
+    rclcpp::Node &node_;
+    bool simulation_;
+    bool has_armed_{false}, offboard_enabled_{false};
+    bool active_{false}, arming_{false}, failed_{false}, pending_{false};
+    bool request_is_mode_{false};
+    int attempts_{0};
+    int64_t request_id_{0};
+    std::chrono::steady_clock::time_point started_, last_request_;
+    rclcpp::Publisher<mavros_msgs::msg::AttitudeTarget>::SharedPtr att_target_pub_;
+    rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
+    rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr set_mode_client_;
+    rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr arm_disarm_client_;
 };
 
 #endif

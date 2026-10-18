@@ -1,15 +1,69 @@
 #include "so3_control/NetworkControl.h"
+#include <algorithm>
+#include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <regex>
+#include <stdexcept>
+
+NetworkControl::NetworkControl(const rclcpp::NodeOptions &options)
+    : rclcpp::Node("network_controller_node", options)
+{
+    mass_ = declare_parameter("mass", 0.98);
+    control_dt_ = declare_parameter("control_dt", 0.02);
+    is_simulation_ = declare_parameter("is_simulation", false);
+    use_disturbance_observer_ = declare_parameter("use_disturbance_observer", false);
+    hover_thrust_ = declare_parameter("hover_thrust", 0.4);
+    kx_xy = declare_parameter("kx_xy", 5.7);
+    kx_z = declare_parameter("kx_z", 6.2);
+    kv_xy = declare_parameter("kv_xy", 3.4);
+    kv_z = declare_parameter("kv_z", 4.0);
+    record_log_ = declare_parameter("record_log", false);
+    logger_file_name = declare_parameter<std::string>("logger_file_name", "/tmp/yopo_logs");
+    takeoff_altitude_ = declare_parameter("takeoff_altitude", 2.0);
+    transition_timeout_ = declare_parameter("flight_transition_timeout", 8.0);
+    auto_takeoff_pending_ = declare_parameter("auto_takeoff", is_simulation_);
+    if (!(mass_ > 0.0) || !(control_dt_ > 0.0) || !(transition_timeout_ > 0.0))
+        throw std::invalid_argument("mass, control_dt and flight_transition_timeout must be positive");
+    so3_controller_.setMass(mass_);
+    disturbance_observer_ = HGDO(control_dt_);
+    mavros_interface_ = std::make_unique<Mavros_Interface>(*this, is_simulation_);
+    so3_command_pub_ = create_publisher<quadrotor_msgs::msg::SO3Command>("so3_cmd", 10);
+    position_cmd_sub_ = create_subscription<quadrotor_msgs::msg::PositionCommand>(
+        "position_cmd", rclcpp::QoS(1),
+        [this](quadrotor_msgs::msg::PositionCommand::ConstSharedPtr msg) { network_cmd_callback(msg); });
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        "odom", rclcpp::SensorDataQoS().keep_last(1),
+        [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) { odom_callback(msg); });
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+        "imu", rclcpp::SensorDataQoS().keep_last(1),
+        [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) { imu_callback(msg); });
+    takeoff_land_srv_ = create_service<quadrotor_msgs::srv::SetTakeoffLand>(
+        "~/takeoff_land",
+        [this](const std::shared_ptr<quadrotor_msgs::srv::SetTakeoffLand::Request> request,
+               std::shared_ptr<quadrotor_msgs::srv::SetTakeoffLand::Response> response) {
+            response->res = begin_takeoff_land(request->takeoff, request->takeoff_altitude);
+        });
+    startup_time_ = now();
+    phase_started_ = now();
+    control_timer_ = rclcpp::create_timer(this, get_clock(),
+        rclcpp::Duration::from_seconds(control_dt_), [this]() { timerCallback(); });
+    RCLCPP_INFO(get_logger(), "SO3 network control ready; mass=%.3f kg, period=%.3f s",
+                mass_, control_dt_);
+}
 
 void NetworkControl::initLogRecorder()
 {   
     // Use file count as name to avoid date confusion
     std::cout << "logger_file_name: " << logger_file_name << std::endl;
     int max_number = -1;
-    boost::filesystem::path dir(logger_file_name);
-    if (boost::filesystem::exists(dir) && boost::filesystem::is_directory(dir)) {
+    std::filesystem::path dir(logger_file_name);
+    std::error_code error;
+    std::filesystem::create_directories(dir, error);
+    if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir)) {
         std::regex filename_pattern(R"(^(\d+)_.*$)"); // 匹配以数字开头，并以"_"分隔的文件名
-        for (const auto& entry : boost::filesystem::directory_iterator(dir)) {
-            if (boost::filesystem::is_regular_file(entry)) {
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            if (std::filesystem::is_regular_file(entry)) {
                 std::string filename = entry.path().filename().string();
                 std::smatch match;
                 if (std::regex_match(filename, match, filename_pattern)) {
@@ -22,7 +76,7 @@ void NetworkControl::initLogRecorder()
         std::cerr << "Error: invalid logger path" << std::endl;
     }
     std::string fileCountStr = std::to_string(max_number + 1);
-    std::string temp_file_name = logger_file_name + fileCountStr + "_Net_logger_";
+    std::string temp_file_name = (dir / (fileCountStr + "_Net_logger_")).string();
     time_t timep;
     timep = time(0);
     char tmp[64];
@@ -76,7 +130,7 @@ void NetworkControl::recordLog(Eigen::Vector3d &cur_v, Eigen::Vector3d &cur_a, E
 {
     if (logger.is_open())
     {
-        logger << ros::Time::now().toNSec() << ',';
+        logger << now().nanoseconds() << ',';
         logger << cur_pos_(0) << ',';
         logger << cur_pos_(1) << ',';
         logger << cur_pos_(2) << ',';
@@ -117,8 +171,8 @@ Eigen::Vector3d NetworkControl::publishHoverSO3Command(Eigen::Vector3d des_pos, 
     Eigen::Vector3d force = so3_controller_.getComputedForce();
     Eigen::Quaterniond orientation = so3_controller_.getComputedOrientation();
 
-    quadrotor_msgs::SO3Command::Ptr so3_command(new quadrotor_msgs::SO3Command); //! @note memory leak?
-    so3_command->header.stamp = ros::Time::now();
+    auto so3_command = std::make_shared<quadrotor_msgs::msg::SO3Command>();
+    so3_command->header.stamp = now();
     so3_command->force.x = force(0);
     so3_command->force.y = force(1);
     so3_command->force.z = force(2);
@@ -126,18 +180,18 @@ Eigen::Vector3d NetworkControl::publishHoverSO3Command(Eigen::Vector3d des_pos, 
     so3_command->orientation.y = orientation.y();
     so3_command->orientation.z = orientation.z();
     so3_command->orientation.w = orientation.w();
-    so3_command->kR[0] = 1.5;
-    so3_command->kR[1] = 1.5;
-    so3_command->kR[2] = 1.0;
-    so3_command->kOm[0] = 0.13;
-    so3_command->kOm[1] = 0.13;
-    so3_command->kOm[2] = 0.1;
+    so3_command->k_r[0] = 1.5;
+    so3_command->k_r[1] = 1.5;
+    so3_command->k_r[2] = 1.0;
+    so3_command->k_om[0] = 0.13;
+    so3_command->k_om[1] = 0.13;
+    so3_command->k_om[2] = 0.1;
     so3_command->aux.current_yaw = cur_yaw_;
     so3_command->aux.enable_motors = true;
-    so3_command_pub_.publish(so3_command);
+    so3_command_pub_->publish(*so3_command);
 
     double thrust_norm = force.norm() / (mass_ * ONE_G) * hover_thrust_;
-    mavros_interface_.pub_att_thrust_cmd(orientation, thrust_norm);
+    mavros_interface_->pub_att_thrust_cmd(orientation, thrust_norm);
     last_thrust_ = thrust_norm;
 
     double thrust = force.norm() / mass_;
@@ -197,8 +251,8 @@ Eigen::Vector3d NetworkControl::pub_SO3_command(Eigen::Vector3d ref_acc, double 
     Eigen::Vector3d force;
     Eigen::Quaterniond quat_des;
     Eigen::Vector3d acc_actual = get_Q_from_ACC(ref_acc, ref_yaw, quat_des, force);
-    quadrotor_msgs::SO3Command::Ptr so3_command(new quadrotor_msgs::SO3Command);
-    so3_command->header.stamp = ros::Time::now();
+    auto so3_command = std::make_shared<quadrotor_msgs::msg::SO3Command>();
+    so3_command->header.stamp = now();
     so3_command->force.x = force(0);
     so3_command->force.y = force(1);
     so3_command->force.z = force(2);
@@ -206,18 +260,18 @@ Eigen::Vector3d NetworkControl::pub_SO3_command(Eigen::Vector3d ref_acc, double 
     so3_command->orientation.y = quat_des.y();
     so3_command->orientation.z = quat_des.z();
     so3_command->orientation.w = quat_des.w();
-    so3_command->kR[0] = 1.5;
-    so3_command->kR[1] = 1.5;
-    so3_command->kR[2] = 1.0;
-    so3_command->kOm[0] = 0.13;
-    so3_command->kOm[1] = 0.13;
-    so3_command->kOm[2] = 0.1;
+    so3_command->k_r[0] = 1.5;
+    so3_command->k_r[1] = 1.5;
+    so3_command->k_r[2] = 1.0;
+    so3_command->k_om[0] = 0.13;
+    so3_command->k_om[1] = 0.13;
+    so3_command->k_om[2] = 0.1;
     so3_command->aux.current_yaw = cur_yaw;
     so3_command->aux.enable_motors = true;
-    so3_command_pub_.publish(so3_command);
+    so3_command_pub_->publish(*so3_command);
 
     double thrust_norm = force.norm() / (mass_ * ONE_G) * hover_thrust_;
-    mavros_interface_.pub_att_thrust_cmd(quat_des, thrust_norm);
+    mavros_interface_->pub_att_thrust_cmd(quat_des, thrust_norm);
     last_thrust_ = thrust_norm;
     return acc_actual;
 }
@@ -231,14 +285,14 @@ void NetworkControl::limite_acc(Eigen::Vector3d &acc){
     }
 }
 
-void NetworkControl::network_cmd_callback(const quadrotor_msgs::PositionCommand::ConstPtr &cmd)
+void NetworkControl::network_cmd_callback(const quadrotor_msgs::msg::PositionCommand::ConstSharedPtr cmd)
 {
     if (!ctrl_valid_)
         return;
 
     bool arm_state = false;
     bool ofb_enable = false;
-    mavros_interface_.get_status(arm_state, ofb_enable);
+    mavros_interface_->get_status(arm_state, ofb_enable);
     if (!arm_state || !ofb_enable)
         return;
 
@@ -252,11 +306,10 @@ void NetworkControl::network_cmd_callback(const quadrotor_msgs::PositionCommand:
     double des_yaw = cmd->yaw;
     
     disturbance_observer_.HGDO_ext_force_ob(last_des_acc_, cur_vel_, dis_acc_);
-    // ROS_INFO_THROTTLE(0.5, "dis_acc: %.3f, %.3f, %.3f", dis_acc_.x(), dis_acc_.y(), dis_acc_.z());
     // std::cout << "dis_acc: " << dis_acc_.transpose() << std::endl;
 
     Eigen::Vector3d att_acc;
-    if (cmd->trajectory_flag == quadrotor_msgs::PositionCommand::TRAJECTORY_STATUS_READY)
+    if (cmd->trajectory_flag == quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY)
     {    
         if (use_disturbance_observer_)
             att_acc = des_acc - dis_acc_;
@@ -278,9 +331,11 @@ void NetworkControl::network_cmd_callback(const quadrotor_msgs::PositionCommand:
     last_des_acc_ = att_acc;
 }
 
-void NetworkControl::odom_callback(const nav_msgs::Odometry::ConstPtr &odom)
+void NetworkControl::odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr odom)
 {
-    cur_yaw_ = tf::getYaw(odom->pose.pose.orientation);
+    const auto &q = odom->pose.pose.orientation;
+    cur_yaw_ = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                          1.0 - 2.0 * (q.y * q.y + q.z * q.z));
     cur_vel_ = Eigen::Vector3d(odom->twist.twist.linear.x, odom->twist.twist.linear.y, odom->twist.twist.linear.z);
 
     cur_pos_ = Eigen::Vector3d(odom->pose.pose.position.x, odom->pose.pose.position.y, odom->pose.pose.position.z);
@@ -295,15 +350,15 @@ void NetworkControl::odom_callback(const nav_msgs::Odometry::ConstPtr &odom)
     so3_controller_.setPosition(cur_pos_);
     so3_controller_.setVelocity(cur_vel_);
     if (!state_init_)
-        ROS_INFO("Odom Recived! Ready to TakeOff...");
+        RCLCPP_INFO(get_logger(), "Odometry received; ready to take off");
     state_init_ = true;
 }
 
-void NetworkControl::imu_callback(const sensor_msgs::Imu &imu)
+void NetworkControl::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr imu)
 {
-    Eigen::Vector3d acc(imu.linear_acceleration.x,
-                        imu.linear_acceleration.y,
-                        imu.linear_acceleration.z);
+    Eigen::Vector3d acc(imu->linear_acceleration.x,
+                        imu->linear_acceleration.y,
+                        imu->linear_acceleration.z);
     if (is_simulation_)
     {
         cur_acc_ = acc;
@@ -318,133 +373,120 @@ void NetworkControl::imu_callback(const sensor_msgs::Imu &imu)
     // so3_controller_.setAcc(acc_world);
 }
 
-void NetworkControl::timerCallback(const ros::TimerEvent &)
+void NetworkControl::timerCallback()
 {
+    if (auto_takeoff_pending_ && state_init_ && (now() - startup_time_).seconds() >= 2.0) {
+        auto_takeoff_pending_ = false;
+        begin_takeoff_land(true, takeoff_altitude_);
+    }
+    mavros_interface_->poll();
+    update_flight_phase();
     if (!state_init_ || !ref_valid_)
         return;
     if (position_cmd_init_ && ctrl_valid_)
         return;
 
-    mutex_.lock();
-    Eigen::Vector3d des_pos_temp = des_pos_;
-    mutex_.unlock();
-
-    Eigen::Vector3d att_acc = publishHoverSO3Command(des_pos_temp, des_vel_, des_acc_, des_yaw_, des_yaw_dot_);
-
+    Eigen::Vector3d att_acc = publishHoverSO3Command(
+        des_pos_, des_vel_, des_acc_, des_yaw_, des_yaw_dot_);
     if (takeoff_cmd_init_)
-    {
         disturbance_observer_.HGDO_ext_force_ob(last_des_acc_, cur_vel_, dis_acc_);
-        // ROS_INFO_THROTTLE(1.0, " dis_acc: (%f, %f, %f)", dis_acc_.x(), dis_acc_.y(), dis_acc_.z());
-    }
-
     last_des_acc_ = att_acc;
     if (record_log_)
         recordLog(cur_vel_, cur_acc_, att_acc, dis_acc_, cur_yaw_, des_yaw_);
     takeoff_cmd_init_ = true;
 }
 
-void NetworkControl::takeoff_land_thread(quadrotor_msgs::SetTakeoffLand::Request &req)
+bool NetworkControl::begin_takeoff_land(bool takeoff, double altitude)
 {
-    mutex_.lock();
-    float takeoff_altitude = req.takeoff_altitude;
+    if (!state_init_ || flight_phase_ != FlightPhase::Idle ||
+        (takeoff && (!std::isfinite(altitude) || altitude <= 0.0))) {
+        RCLCPP_WARN(get_logger(), "Takeoff/landing rejected: no odometry, invalid altitude or transition active");
+        return false;
+    }
+    auto_takeoff_pending_ = false;
+    ctrl_valid_ = false;
+    position_cmd_init_ = false;
+    takeoff_cmd_init_ = false;
     des_pos_ = cur_pos_;
     des_pos_(2) -= 0.2;
-    des_vel_ = Eigen::Vector3d(0, 0, 0);
+    des_vel_.setZero();
+    des_acc_.setZero();
     des_yaw_ = cur_yaw_;
-    mutex_.unlock();
+    des_yaw_dot_ = 0.0;
     ref_valid_ = true;
-
-    if (req.takeoff)
-    {
-        std::cout << "takeoff process start" << std::endl;
-        if (!arm_disarm_vehicle(true))
-        {
-            std::cout << "Service failed because cannot Arm!" << std::endl;
-            return;
-        }
-        sleep(1);
-
-        double takeoff_vel = 0.8;
-        double takeoff_ddz = takeoff_vel * control_dt_;
-        ros::Rate takeoff_loop(1 / control_dt_);
-        std::cout << "takeoff altitude: " << takeoff_altitude << " m" << std::endl;
-        std::cout << "takeoff velocity: " << takeoff_vel << " m/s" << std::endl;
-        ros::Time start_takeoff_task_time = ros::Time::now();
-        while (ros::ok() && ros::Time::now() - start_takeoff_task_time < ros::Duration(8.0))
-        {       
-            mutex_.lock();
-            des_pos_(2) += takeoff_ddz;
-            mutex_.unlock();
-
-            if (des_pos_(2) > takeoff_altitude)
-            {
-                ROS_INFO("TakeOff Done! Ready to Flight...");
-                ctrl_valid_ = true;
-                break;
-            }
-            takeoff_loop.sleep();
-        }
-    }
-    else
-    {
-        ctrl_valid_ = false;
-        double land_vel = -0.4;
-        double land_ddz = land_vel * control_dt_;
-        ros::Rate land_loop(1 / control_dt_);
-        ros::Time start_land_task_time = ros::Time::now();
-        while (ros::ok() && ros::Time::now() - start_land_task_time < ros::Duration(8.0))
-        {
-            mutex_.lock();
-            des_pos_(2) += land_ddz;
-            mutex_.unlock();
-
-            if (fabs(cur_pos_(2)) < 0.1f && fabs(cur_vel_(2)) < 1.0f)
-            {
-                ROS_INFO("detect land: disarm");
-                arm_disarm_vehicle(false);
-                break;
-            }
-            land_loop.sleep();
-        }
-    }
-    ROS_INFO("take off thread out");
-    return;
-}
-
-bool NetworkControl::arm_disarm_vehicle(bool arm)
-{
-    if (arm)
-    {   
-        if (!state_init_){
-            ROS_WARN("State timeout, will not arm!");
-            return false;
-        }
-
-        ROS_INFO("UAV will be armed!");
-        if (is_simulation_)
-            mavros_interface_.set_arm_and_offboard_manually();
-        else if (mavros_interface_.set_arm_and_offboard())
-            ROS_INFO("Arm done!");
-        else{
-            ROS_ERROR("Arm failure!");
-            return false;
-        }
-        if (record_log_)
-            initLogRecorder();
-    }
-    else
-    {
-        ROS_INFO("UAV will be disarmed!");
-        if (is_simulation_)
-            mavros_interface_.set_disarm_manually();
-        else if (mavros_interface_.set_disarm())
-            ROS_INFO("Disarm done!");
-        else {
-            ROS_ERROR("Disarm failure!");
-            return false;
-        }
-        if (record_log_)
-            logger.close();
+    phase_started_ = now();
+    if (takeoff) {
+        takeoff_altitude_ = altitude;
+        mavros_interface_->request_arm_and_offboard();
+        flight_phase_ = FlightPhase::WaitingArm;
+        RCLCPP_INFO(get_logger(), "Takeoff accepted: target altitude %.2f m", altitude);
+    } else {
+        flight_phase_ = FlightPhase::Landing;
+        RCLCPP_INFO(get_logger(), "Landing accepted");
     }
     return true;
+}
+
+void NetworkControl::update_flight_phase()
+{
+    bool armed, offboard;
+    mavros_interface_->get_status(armed, offboard);
+    switch (flight_phase_) {
+    case FlightPhase::WaitingArm:
+        if (mavros_interface_->operation_failed()) {
+            flight_phase_ = FlightPhase::Idle;
+            ref_valid_ = false;
+            RCLCPP_ERROR(get_logger(), "Takeoff aborted: could not arm in OFFBOARD");
+        } else if (armed && offboard) {
+            if (record_log_)
+                initLogRecorder();
+            flight_phase_ = FlightPhase::ArmDelay;
+            phase_started_ = now();
+        }
+        break;
+    case FlightPhase::ArmDelay:
+        if ((now() - phase_started_).seconds() >= 1.0) {
+            flight_phase_ = FlightPhase::TakingOff;
+            phase_started_ = now();
+        }
+        break;
+    case FlightPhase::TakingOff:
+        des_pos_(2) = std::min(takeoff_altitude_, des_pos_(2) + 0.8 * control_dt_);
+        if (des_pos_(2) >= takeoff_altitude_) {
+            flight_phase_ = FlightPhase::Idle;
+            ctrl_valid_ = true;
+            RCLCPP_INFO(get_logger(), "Takeoff reference reached; accepting planner commands");
+        } else if ((now() - phase_started_).seconds() > transition_timeout_) {
+            flight_phase_ = FlightPhase::Idle;
+            des_pos_ = cur_pos_;
+            RCLCPP_ERROR(get_logger(), "Takeoff timed out; holding current position");
+        }
+        break;
+    case FlightPhase::Landing:
+        des_pos_(2) -= 0.4 * control_dt_;
+        if (std::fabs(cur_pos_(2)) < 0.1 && std::fabs(cur_vel_(2)) < 1.0) {
+            mavros_interface_->request_disarm();
+            flight_phase_ = FlightPhase::WaitingDisarm;
+        } else if ((now() - phase_started_).seconds() > transition_timeout_) {
+            flight_phase_ = FlightPhase::Idle;
+            des_pos_ = cur_pos_;
+            RCLCPP_ERROR(get_logger(), "Landing timed out; holding current position");
+        }
+        break;
+    case FlightPhase::WaitingDisarm:
+        if (mavros_interface_->operation_failed()) {
+            flight_phase_ = FlightPhase::Idle;
+            des_pos_ = cur_pos_;
+            RCLCPP_ERROR(get_logger(), "Disarm failed; holding current position");
+        } else if (!armed) {
+            flight_phase_ = FlightPhase::Idle;
+            ref_valid_ = false;
+            if (logger.is_open())
+                logger.close();
+            RCLCPP_INFO(get_logger(), "Landing complete; vehicle disarmed");
+        }
+        break;
+    case FlightPhase::Idle:
+        break;
+    }
 }

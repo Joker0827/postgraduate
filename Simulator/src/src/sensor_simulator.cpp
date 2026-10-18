@@ -133,32 +133,37 @@ void SensorSimulator::expand_cloud(pcl::PointCloud<pcl::PointXYZ>::Ptr expanded_
 }
 
 
-void SensorSimulator::timerDepthCallback(const ros::TimerEvent&) {
+void SensorSimulator::timerDepthCallback() {
     if (!odom_init || !render_depth)
         return;
     cv::Mat depth_iamge = renderDepthImage();
-    sensor_msgs::Image ros_image;
+    sensor_msgs::msg::Image ros_image;
     cv_bridge::CvImage cv_image;
-    cv_image.header.stamp = ros::Time::now();
+    cv_image.header.stamp = odom_stamp_;
+    cv_image.header.frame_id = "camera_link";
     cv_image.encoding = sensor_msgs::image_encodings::TYPE_32FC1;
     cv_image.image = depth_iamge;
     cv_image.toImageMsg(ros_image);
-    image_pub_.publish(ros_image);
+    image_pub_->publish(ros_image);
 }
 
-void SensorSimulator::timerLidarCallback(const ros::TimerEvent&) {
+void SensorSimulator::timerLidarCallback() {
     if (!odom_init || !render_lidar)
         return;
     pcl::PointCloud<pcl::PointXYZ> lidar_points = renderLidarPointcloud();
-    sensor_msgs::PointCloud2 output;
+    sensor_msgs::msg::PointCloud2 output;
     pcl::toROSMsg(lidar_points, output);
-    output.header.stamp = ros::Time::now();
-    output.header.frame_id = "odom";
+    output.header.stamp = odom_stamp_;
+    output.header.frame_id = body_frame_;
 
-    point_cloud_pub_.publish(output);
+    point_cloud_pub_->publish(output);
 }
 
-void SensorSimulator::odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
+void SensorSimulator::odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+    odom_stamp_ = msg->header.stamp;
+    if (!msg->child_frame_id.empty()) {
+        body_frame_ = msg->child_frame_id;
+    }
     quat.x() = msg->pose.pose.orientation.x;
     quat.y() = msg->pose.pose.orientation.y;
     quat.z() = msg->pose.pose.orientation.z;

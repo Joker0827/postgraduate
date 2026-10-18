@@ -1,36 +1,40 @@
-# 真实环境点云/深度图仿真(支持CUDA)
+# ROS 2 Humble 点云/深度图仿真（支持 CUDA）
 
 ### 1 依赖
 
-CUDA; ROS; OpenCV; PCL; (如果已经安装ROS依赖基本都满足) yaml-cpp
-```angular2html
-sudo apt-get install libyaml-cpp-dev
+Ubuntu 22.04、ROS 2 Humble、OpenCV、PCL、yaml-cpp；GPU 版本还需要 CUDA。
+```bash
+sudo apt-get install ros-humble-cv-bridge ros-humble-pcl-conversions libyaml-cpp-dev
 ```
 
 ### 2 编译
-```angular2html
-catkin build
+从仓库根目录编译：
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --packages-select sensor_simulator --cmake-args -DCMAKE_CUDA_ARCHITECTURES=89
 ```
-注：在CmakeList中采用`cuda_select_nvcc_arch_flags`自动检测，如果遇到编译错误，你需要手动设置CUDA架构，请将CmakeList 25行起：
-```
-cuda_select_nvcc_arch_flags(ARCH_FLAGS)
-...
-endif()
-```
-替换为(5060 GPU是120, 需要根据自己设备设置)：
-```
-set(ARCH_FLAGS "-gencode arch=compute_120,code=sm_120")
+RTX 4060 使用架构 `89`；Jetson Orin 使用 `87`。无 CUDA 时只编译 CPU 版本：
+```bash
+colcon build --packages-select sensor_simulator --cmake-args -DENABLE_CUDA=OFF
 ```
 
 ### 3 运行
-```angular2html
-source devel/setup.bash
+```bash
+source install/setup.bash
 # GPU版本 (推荐, RTX 3060 深度输出 > 1000fps)
-rosrun sensor_simulator sensor_simulator_cuda
+ros2 run sensor_simulator sensor_simulator_cuda
 
 # CPU版本 (资源占用高，仅供GPU编译失败无法解决时测试)
-rosrun sensor_simulator sensor_simulator
+ros2 run sensor_simulator sensor_simulator
 ```
+
+节点默认读取安装目录中的 `share/sensor_simulator/config/config.yaml`。通过参数覆盖配置：
+```bash
+ros2 run sensor_simulator sensor_simulator_cuda --ros-args -p config_file:=/absolute/path/config.yaml
+```
+点云路径相对配置目录或包目录解析，也兼容原有的 `src/pointcloud/tree.ply`。
+`/sim/odom`、`/depth_image`、`/lidar_points` 使用 best-effort SensorData QoS；
+`/mock_map` 使用 reliable + transient-local QoS，后加入的可视化节点也能收到地图。
 
 传感器参数以及点云环境修改见[config](config/config.yaml)，重要参数说明:
 ```
@@ -45,13 +49,20 @@ maze_type: 5   # 1: 溶洞 2: 柱子 3:迷宫 5:森林 6:房间
 ```
 
 ### 4 仿真位置发布与简单可视化（可选）
-```angular2html
-cd src/sensor_simulator
-python sim_odom.py
-
-cd src/sensor_simulator
-rviz -d rviz.rviz
+```bash
+ros2 run sensor_simulator sim_odom.py
 ```
+
+整套控制器、规划器和 RViz 2 启动方法见仓库根目录说明。
+
+### 数据集生成
+
+```bash
+ros2 run sensor_simulator dataset_generator --config /absolute/path/config.yaml
+```
+生成器会**删除并重建 `save_path` 整个目录**。默认配置保留仓库的 `dataset/`
+输出位置；自定义配置中的相对 `save_path` 相对该 YAML 所在目录解析。
+绝对输出路径不变。先用小规模 `env_num` 和 `image_num` 检查配置，再生成完整数据。
 
 
 ### 5 实时性与资源占用

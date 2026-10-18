@@ -1,68 +1,61 @@
 #include <Eigen/Geometry>
-#include <nav_msgs/Odometry.h>
-#include <nodelet/nodelet.h>
-#include <quadrotor_msgs/Corrections.h>
-#include <quadrotor_msgs/PositionCommand.h>
-#include <quadrotor_msgs/SO3Command.h>
-#include <ros/ros.h>
-#include <sensor_msgs/Imu.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <quadrotor_msgs/msg/corrections.hpp>
+#include <quadrotor_msgs/msg/position_command.hpp>
+#include <quadrotor_msgs/msg/so3_command.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <so3_control/SO3Control.h>
-#include <std_msgs/Bool.h>
-#include <tf/transform_datatypes.h>
+#include <std_msgs/msg/bool.hpp>
+#include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <iostream>
 #include <fstream>
 
-class SO3ControlNodelet : public nodelet::Nodelet
+class SO3ControlNode : public rclcpp::Node
 {
 public:
-  SO3ControlNodelet()
-    : position_cmd_updated_(false)
-    , position_cmd_init_(false)
-    , des_yaw_(0)
-    , des_yaw_dot_(0)
-    , current_yaw_(0)
-    , enable_motors_(true)
-    , // FIXME
-    use_external_yaw_(false)
-  {
-  }
-
-  void onInit(void);
+  explicit SO3ControlNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
 private:
   void publishSO3Command(void);
   void position_cmd_callback(
-    const quadrotor_msgs::PositionCommand::ConstPtr& cmd);
-  void odom_callback(const nav_msgs::Odometry::ConstPtr& odom);
-  void enable_motors_callback(const std_msgs::Bool::ConstPtr& msg);
-  void corrections_callback(const quadrotor_msgs::Corrections::ConstPtr& msg);
-  void imu_callback(const sensor_msgs::Imu& imu);
+    quadrotor_msgs::msg::PositionCommand::ConstSharedPtr cmd);
+  void odom_callback(nav_msgs::msg::Odometry::ConstSharedPtr odom);
+  void enable_motors_callback(std_msgs::msg::Bool::ConstSharedPtr msg);
+  void corrections_callback(quadrotor_msgs::msg::Corrections::ConstSharedPtr msg);
+  void imu_callback(sensor_msgs::msg::Imu::ConstSharedPtr imu);
 
   void initLogRecorder();
   void recordLog();
 
   SO3Control      controller_;
-  ros::Publisher  so3_command_pub_;
-  ros::Subscriber odom_sub_;
-  ros::Subscriber position_cmd_sub_;
-  ros::Subscriber enable_motors_sub_;
-  ros::Subscriber corrections_sub_;
-  ros::Subscriber imu_sub_;
+  rclcpp::Publisher<quadrotor_msgs::msg::SO3Command>::SharedPtr so3_command_pub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<quadrotor_msgs::msg::PositionCommand>::SharedPtr position_cmd_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_motors_sub_;
+  rclcpp::Subscription<quadrotor_msgs::msg::Corrections>::SharedPtr corrections_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
 
-  bool        position_cmd_updated_, position_cmd_init_;
+  bool        position_cmd_updated_{false}, position_cmd_init_{false};
   std::string frame_id_;
 
   bool record_log_{false};
   bool cur_acc_init_{false}, cur_odom_init_{false};
-  Eigen::Vector3d des_pos_, des_vel_, des_acc_, kx_, kv_;
-  Eigen::Vector3d cur_pos_, cur_vel_, cur_acc_;
-  double          des_yaw_, des_yaw_dot_;
-  double          current_yaw_;
-  bool            enable_motors_;
-  bool            use_external_yaw_;
+  Eigen::Vector3d des_pos_{Eigen::Vector3d::Zero()}, des_vel_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d des_acc_{Eigen::Vector3d::Zero()}, kx_, kv_;
+  Eigen::Vector3d cur_pos_{Eigen::Vector3d::Zero()}, cur_vel_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d cur_acc_{Eigen::Vector3d::Zero()};
+  double          des_yaw_{0}, des_yaw_dot_{0};
+  double          current_yaw_{0};
+  bool            enable_motors_{true};
+  bool            use_external_yaw_{true};
   double          kR_[3], kOm_[3], corrections_[3];
   double          init_x_, init_y_, init_z_;
 
@@ -71,7 +64,7 @@ private:
 };
 
 void
-SO3ControlNodelet::publishSO3Command(void)
+SO3ControlNode::publishSO3Command(void)
 {
   controller_.calculateControl(des_pos_, des_vel_, des_acc_, des_yaw_,
                                des_yaw_dot_, kx_, kv_);
@@ -79,9 +72,8 @@ SO3ControlNodelet::publishSO3Command(void)
   const Eigen::Vector3d&    force       = controller_.getComputedForce();
   const Eigen::Quaterniond& orientation = controller_.getComputedOrientation();
 
-  quadrotor_msgs::SO3Command::Ptr so3_command(
-    new quadrotor_msgs::SO3Command); //! @note memory leak?
-  so3_command->header.stamp    = ros::Time::now();
+  auto so3_command = std::make_shared<quadrotor_msgs::msg::SO3Command>();
+  so3_command->header.stamp    = now();
   so3_command->header.frame_id = frame_id_;
   so3_command->force.x         = force(0);
   so3_command->force.y         = force(1);
@@ -92,8 +84,8 @@ SO3ControlNodelet::publishSO3Command(void)
   so3_command->orientation.w   = orientation.w();
   for (int i = 0; i < 3; i++)
   {
-    so3_command->kR[i]  = kR_[i];
-    so3_command->kOm[i] = kOm_[i];
+    so3_command->k_r[i]  = kR_[i];
+    so3_command->k_om[i] = kOm_[i];
   }
   so3_command->aux.current_yaw          = current_yaw_;
   so3_command->aux.kf_correction        = corrections_[0];
@@ -101,12 +93,12 @@ SO3ControlNodelet::publishSO3Command(void)
   so3_command->aux.angle_corrections[1] = corrections_[2];
   so3_command->aux.enable_motors        = enable_motors_;
   so3_command->aux.use_external_yaw     = use_external_yaw_;
-  so3_command_pub_.publish(so3_command);
+  so3_command_pub_->publish(*so3_command);
 }
 
 void
-SO3ControlNodelet::position_cmd_callback(
-  const quadrotor_msgs::PositionCommand::ConstPtr& cmd)
+SO3ControlNode::position_cmd_callback(
+  quadrotor_msgs::msg::PositionCommand::ConstSharedPtr cmd)
 {
   des_pos_ = Eigen::Vector3d(cmd->position.x, cmd->position.y, cmd->position.z);
   des_vel_ = Eigen::Vector3d(cmd->velocity.x, cmd->velocity.y, cmd->velocity.z);
@@ -137,7 +129,7 @@ SO3ControlNodelet::position_cmd_callback(
 }
 
 void
-SO3ControlNodelet::odom_callback(const nav_msgs::Odometry::ConstPtr& odom)
+SO3ControlNode::odom_callback(nav_msgs::msg::Odometry::ConstSharedPtr odom)
 {
   const Eigen::Vector3d position(odom->pose.pose.position.x,
                                  odom->pose.pose.position.y,
@@ -147,7 +139,9 @@ SO3ControlNodelet::odom_callback(const nav_msgs::Odometry::ConstPtr& odom)
                                  odom->twist.twist.linear.z);
 
   cur_odom_init_ = true;
-  current_yaw_ = tf::getYaw(odom->pose.pose.orientation);
+  const auto &q = odom->pose.pose.orientation;
+  current_yaw_ = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                           1.0 - 2.0 * (q.y * q.y + q.z * q.z));
   cur_pos_ = position;
   cur_vel_ = velocity;
 
@@ -177,19 +171,19 @@ SO3ControlNodelet::odom_callback(const nav_msgs::Odometry::ConstPtr& odom)
 }
 
 void
-SO3ControlNodelet::enable_motors_callback(const std_msgs::Bool::ConstPtr& msg)
+SO3ControlNode::enable_motors_callback(std_msgs::msg::Bool::ConstSharedPtr msg)
 {
   if (msg->data)
-    ROS_INFO("Enabling motors");
+    RCLCPP_INFO(get_logger(), "Enabling motors");
   else
-    ROS_INFO("Disabling motors");
+    RCLCPP_INFO(get_logger(), "Disabling motors");
 
   enable_motors_ = msg->data;
 }
 
 void
-SO3ControlNodelet::corrections_callback(
-  const quadrotor_msgs::Corrections::ConstPtr& msg)
+SO3ControlNode::corrections_callback(
+  quadrotor_msgs::msg::Corrections::ConstSharedPtr msg)
 {
   corrections_[0] = msg->kf_correction;
   corrections_[1] = msg->angle_corrections[0];
@@ -197,81 +191,71 @@ SO3ControlNodelet::corrections_callback(
 }
 
 void
-SO3ControlNodelet::imu_callback(const sensor_msgs::Imu& imu)
+SO3ControlNode::imu_callback(sensor_msgs::msg::Imu::ConstSharedPtr imu)
 {
   cur_acc_init_ = true;
-  const Eigen::Vector3d acc(imu.linear_acceleration.x,
-                            imu.linear_acceleration.y,
-                            imu.linear_acceleration.z);
+  const Eigen::Vector3d acc(imu->linear_acceleration.x,
+                            imu->linear_acceleration.y,
+                            imu->linear_acceleration.z);
   cur_acc_ = acc;
   controller_.setAcc(acc);
 }
 
-void
-SO3ControlNodelet::onInit(void)
+SO3ControlNode::SO3ControlNode(const rclcpp::NodeOptions &options)
+  : rclcpp::Node("so3_control", options)
 {
-  ros::NodeHandle n(getPrivateNodeHandle());
-
-  std::string quadrotor_name;
-  n.param("quadrotor_name", quadrotor_name, std::string("quadrotor"));
-  frame_id_ = "/" + quadrotor_name;
-
-  double mass;
-  n.param("mass", mass, 0.5);
+  frame_id_ = declare_parameter<std::string>("quadrotor_name", "quadrotor");
+  const double mass = declare_parameter("mass", 0.98);
+  if (!(mass > 0.0))
+    throw std::invalid_argument("mass must be positive");
   controller_.setMass(mass);
-  
-  n.param("record_log", record_log_, false);
-  n.param("PID_logger_file_name", logger_file_name, std::string("/home/lu/"));
-  n.param("use_external_yaw", use_external_yaw_, true);
-
-  n.param("gains/rot/x", kR_[0], 1.5);
-  n.param("gains/rot/y", kR_[1], 1.5);
-  n.param("gains/rot/z", kR_[2], 1.0);
-  n.param("gains/ang/x", kOm_[0], 0.13);
-  n.param("gains/ang/y", kOm_[1], 0.13);
-  n.param("gains/ang/z", kOm_[2], 0.1);
-  n.param("gains/kx/x", kx_[0], 5.7);
-  n.param("gains/kx/y", kx_[1], 5.7);
-  n.param("gains/kx/z", kx_[2], 6.2);
-  n.param("gains/kv/x", kv_[0], 3.4);
-  n.param("gains/kv/y", kv_[1], 3.4);
-  n.param("gains/kv/z", kv_[2], 4.0);
-
-  n.param("corrections/z", corrections_[0], 0.0);
-  n.param("corrections/r", corrections_[1], 0.0);
-  n.param("corrections/p", corrections_[2], 0.0);
-
-  n.param("so3_control/init_state_x", init_x_, 0.0);
-  n.param("so3_control/init_state_y", init_y_, 0.0);
-  n.param("so3_control/init_state_z", init_z_, -10000.0);
-
-  so3_command_pub_ = n.advertise<quadrotor_msgs::SO3Command>("so3_cmd", 10);
-
-  odom_sub_ = n.subscribe("odom", 10, &SO3ControlNodelet::odom_callback, this,
-                          ros::TransportHints().tcpNoDelay());
-  position_cmd_sub_ =
-    n.subscribe("position_cmd", 10, &SO3ControlNodelet::position_cmd_callback,
-                this, ros::TransportHints().tcpNoDelay());
-
-  enable_motors_sub_ =
-    n.subscribe("motors", 2, &SO3ControlNodelet::enable_motors_callback, this,
-                ros::TransportHints().tcpNoDelay());
-  corrections_sub_ =
-    n.subscribe("corrections", 10, &SO3ControlNodelet::corrections_callback,
-                this, ros::TransportHints().tcpNoDelay());
-
-  imu_sub_ = n.subscribe("imu", 10, &SO3ControlNodelet::imu_callback, this,
-                         ros::TransportHints().tcpNoDelay());
-  
+  record_log_ = declare_parameter("record_log", false);
+  logger_file_name = declare_parameter<std::string>("PID_logger_file_name", "/tmp/yopo_logs");
+  use_external_yaw_ = declare_parameter("use_external_yaw", true);
+  kR_[0] = declare_parameter("gains.rot.x", 1.5);
+  kR_[1] = declare_parameter("gains.rot.y", 1.5);
+  kR_[2] = declare_parameter("gains.rot.z", 1.0);
+  kOm_[0] = declare_parameter("gains.ang.x", 0.13);
+  kOm_[1] = declare_parameter("gains.ang.y", 0.13);
+  kOm_[2] = declare_parameter("gains.ang.z", 0.1);
+  kx_[0] = declare_parameter("gains.kx.x", 5.7);
+  kx_[1] = declare_parameter("gains.kx.y", 5.7);
+  kx_[2] = declare_parameter("gains.kx.z", 6.2);
+  kv_[0] = declare_parameter("gains.kv.x", 3.4);
+  kv_[1] = declare_parameter("gains.kv.y", 3.4);
+  kv_[2] = declare_parameter("gains.kv.z", 4.0);
+  corrections_[0] = declare_parameter("corrections.z", 0.0);
+  corrections_[1] = declare_parameter("corrections.r", 0.0);
+  corrections_[2] = declare_parameter("corrections.p", 0.0);
+  init_x_ = declare_parameter("so3_control.init_state_x", 0.0);
+  init_y_ = declare_parameter("so3_control.init_state_y", 0.0);
+  init_z_ = declare_parameter("so3_control.init_state_z", -10000.0);
+  so3_command_pub_ = create_publisher<quadrotor_msgs::msg::SO3Command>("so3_cmd", 10);
+  odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+    "odom", rclcpp::SensorDataQoS().keep_last(1),
+    [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) { odom_callback(msg); });
+  position_cmd_sub_ = create_subscription<quadrotor_msgs::msg::PositionCommand>(
+    "position_cmd", rclcpp::QoS(1),
+    [this](quadrotor_msgs::msg::PositionCommand::ConstSharedPtr msg) { position_cmd_callback(msg); });
+  enable_motors_sub_ = create_subscription<std_msgs::msg::Bool>(
+    "motors", 2, [this](std_msgs::msg::Bool::ConstSharedPtr msg) { enable_motors_callback(msg); });
+  corrections_sub_ = create_subscription<quadrotor_msgs::msg::Corrections>(
+    "corrections", 10,
+    [this](quadrotor_msgs::msg::Corrections::ConstSharedPtr msg) { corrections_callback(msg); });
+  imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+    "imu", rclcpp::SensorDataQoS().keep_last(1),
+    [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) { imu_callback(msg); });
   if (record_log_)
     initLogRecorder();
-  
 }
 
-void SO3ControlNodelet::initLogRecorder()
+void SO3ControlNode::initLogRecorder()
 {
   std::cout << "logger_file_name: " << logger_file_name << std::endl;
-  std::string temp_file_name = logger_file_name + "PID_logger_";
+  const std::filesystem::path directory(logger_file_name);
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  std::string temp_file_name = (directory / "PID_logger_").string();
   time_t timep;
   timep = time(0);
   char tmp[64];
@@ -315,10 +299,10 @@ void SO3ControlNodelet::initLogRecorder()
     logger << "des_acc_z" << std::endl;
   }
 }
-void SO3ControlNodelet::recordLog(){
+void SO3ControlNode::recordLog(){
   if (logger.is_open())
   {
-    logger << ros::Time::now().toNSec() << ',';
+    logger << now().nanoseconds() << ',';
     logger << cur_pos_(0) << ',';
     logger << cur_pos_(1) << ',';
     logger << cur_pos_(2) << ',';
@@ -344,7 +328,10 @@ void SO3ControlNodelet::recordLog(){
   }
 }
 
-#include <pluginlib/class_list_macros.h>
-//PLUGINLIB_DECLARE_CLASS(so3_control, SO3ControlNodelet, SO3ControlNodelet,
-//                        nodelet::Nodelet);
-PLUGINLIB_EXPORT_CLASS(SO3ControlNodelet, nodelet::Nodelet);
+int main(int argc, char **argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<SO3ControlNode>());
+  rclcpp::shutdown();
+  return 0;
+}

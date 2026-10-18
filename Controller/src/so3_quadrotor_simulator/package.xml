@@ -1,28 +1,23 @@
-<package>
-  <version>0.0.0</version>
+<?xml version="1.0"?>
+<package format="3">
   <name>so3_quadrotor_simulator</name>
-  <description>
-
-     quadrotor_simulator
-
-  </description>
-
+  <version>0.0.0</version>
+  <description>ROS 2 quadrotor dynamics simulator with SO(3) attitude control.</description>
   <maintainer email="todo@todo.todo">Kartik Mohta</maintainer>
   <license>BSD</license>
-  <url>http://ros.org/wiki/quadrotor_simulator</url>
-
-  <buildtool_depend>catkin</buildtool_depend>
-
-  <build_depend>roscpp</build_depend>
-  <build_depend>quadrotor_msgs</build_depend>
-  <build_depend>uav_utils</build_depend>
-  <build_depend>cmake_utils</build_depend>
-
-  <run_depend>roscpp</run_depend>
-  <run_depend>quadrotor_msgs</run_depend>
-  <run_depend>uav_utils</run_depend>
-  <run_depend>cmake_utils</run_depend>
-
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>quadrotor_msgs</depend>
+  <depend>uav_utils</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>eigen</depend>
+  <depend>boost</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>so3_control</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
 </package>
-
-
