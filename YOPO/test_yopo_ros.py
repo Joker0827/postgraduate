@@ -43,7 +43,7 @@ class YopoNet(Node):
         if velocity <= 0:
             raise ValueError('velocity must be positive')
         cfg['velocity'] = velocity
-        self.arrival_distance = self.declare_parameter('arrival_distance', 5.0).value
+        self.arrival_distance = self.declare_parameter('arrival_distance', 2.0).value
         self.goal_altitude = self.declare_parameter('goal_altitude', 2.0).value
         self.world_frame = self.declare_parameter('world_frame', 'world').value
         # load params
